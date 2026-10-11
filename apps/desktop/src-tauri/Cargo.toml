@@ -1,3 +1,9 @@
 [workspace]
 members = ["crates/db", "crates/lan-api"]
 resolver = "2"
+
+# Argon2 is deliberately slow; keep it optimized even in debug builds so tests stay fast.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

@@ -5,13 +5,19 @@
 //! Request pipeline for /v1/* (except /v1/health):
 //!   1. version handshake  (X-Api-Version must be within the supported range, else 426)
 //!   2. device auth        (X-Device-Id + X-Device-Secret, checked against stored hashes)
+//!   3. user session       (`Authorization: Bearer <token>` from /v1/auth/login), for the routes that
+//!                         act as a user; the session must belong to the calling device
 //! Pairing codes are created locally on the server (not over the network) by an administrator.
+//!
+//! Subscription rule: business writes call `entitlement::decide` and are refused unless the mode allows
+//! writing. Sign-in, sign-out and changing your own password/PIN are NOT business writes and keep
+//! working when a subscription is suspended (otherwise a lapse would lock the owner out of their data).
 
 pub mod entitlement;
 pub mod tls;
 
 use axum::{
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -21,6 +27,7 @@ use axum::{
 use dsaas_db::{
     pairing::{self, DeviceAuth, PairError},
     rusqlite::Connection,
+    users::{self, Method, Principal, UserError},
     DbError, Writer,
 };
 use serde::{Deserialize, Serialize};
@@ -51,6 +58,13 @@ pub enum ApiError {
     Internal,
     SubscriptionInactive(&'static str),
     DeviceLimit,
+    InvalidCredentials,
+    SessionRequired,
+    Forbidden,
+    PasswordRequired,
+    UserLimit,
+    Conflict(&'static str),
+    NotFound,
 }
 
 impl IntoResponse for ApiError {
@@ -72,6 +86,22 @@ impl IntoResponse for ApiError {
                 (StatusCode::PAYMENT_REQUIRED, "subscription_inactive", "your subscription does not currently allow this action")
             }
             ApiError::DeviceLimit => (StatusCode::FORBIDDEN, "device_limit_reached", "the device limit of your plan has been reached"),
+            // Deliberately vague: wrong password, unknown user, locked and deactivated look the same.
+            ApiError::InvalidCredentials => (
+                StatusCode::UNAUTHORIZED,
+                "invalid_credentials",
+                "invalid username or password, or the account is temporarily locked",
+            ),
+            ApiError::SessionRequired => (StatusCode::UNAUTHORIZED, "session_required", "sign in to continue"),
+            ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden", "you do not have permission to do this"),
+            ApiError::PasswordRequired => (
+                StatusCode::FORBIDDEN,
+                "password_login_required",
+                "sign in with your password (not a PIN) to do this",
+            ),
+            ApiError::UserLimit => (StatusCode::FORBIDDEN, "user_limit_reached", "the user limit of your plan has been reached"),
+            ApiError::Conflict(m) => (StatusCode::CONFLICT, "conflict", m),
+            ApiError::NotFound => (StatusCode::NOT_FOUND, "not_found", "not found"),
         };
         let body = serde_json::json!({
             "error": code,
@@ -138,6 +168,234 @@ async fn require_device(State(st): State<AppState>, mut req: Request, next: Next
         Ok(DeviceAuth::Invalid) => ApiError::Unauthorized.into_response(),
         Err(e) => e.into_response(),
     }
+}
+
+fn user_err(e: UserError) -> ApiError {
+    match e {
+        UserError::InvalidCredentials => ApiError::InvalidCredentials,
+        UserError::BadInput(m) => ApiError::BadRequest(m),
+        UserError::Conflict(m) => ApiError::Conflict(m),
+        UserError::NotFound => ApiError::NotFound,
+        UserError::Sqlite(_) => ApiError::Internal,
+    }
+}
+
+fn now_utc(c: &Connection) -> Result<String, DbError> {
+    Ok(c.query_row(NOW_SQL, [], |r| r.get(0))?)
+}
+
+/// Sign-in required: resolve `Authorization: Bearer <token>` to a user for the calling device.
+/// Runs after `require_device`, which supplies the device id.
+async fn require_session(State(st): State<AppState>, mut req: Request, next: Next) -> Response {
+    let token = header(&req, "authorization")
+        .and_then(|h| h.strip_prefix("Bearer ").map(|t| t.trim().to_string()))
+        .filter(|t| !t.is_empty() && t.len() <= 128);
+    let device = req.extensions().get::<AuthedDevice>().map(|d| d.0.clone());
+    let (Some(token), Some(device)) = (token, device) else {
+        return ApiError::SessionRequired.into_response();
+    };
+    let tenant = st.tenant_id.to_string();
+    let found = db(&st, move |c| {
+        let now = now_utc(c)?;
+        users::authenticate_session(c, &tenant, &device, &token, &now)
+    })
+    .await;
+    match found {
+        Ok(Some(p)) => {
+            req.extensions_mut().insert(p);
+            next.run(req).await
+        }
+        Ok(None) => ApiError::SessionRequired.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Shared gate for user administration: password sign-in, the `users.manage` permission, and a
+/// subscription that allows writes. Returns the plan's user limit.
+fn guard_user_admin(c: &Connection, tenant: &str, pk: &[u8; 32], p: &Principal) -> Result<Result<i64, ApiError>, DbError> {
+    if p.method != Method::Password {
+        return Ok(Err(ApiError::PasswordRequired));
+    }
+    if !p.can("users.manage") {
+        return Ok(Err(ApiError::Forbidden));
+    }
+    let (dec, ent) = entitlement::decide(c, tenant, pk)?;
+    if !dec.mode.can_write() {
+        return Ok(Err(ApiError::SubscriptionInactive(dec.reason)));
+    }
+    Ok(Ok(ent.map(|e| e.limits.max_users).unwrap_or(0)))
+}
+
+#[derive(Deserialize)]
+struct LoginReq {
+    username: String,
+    password: Option<String>,
+    pin: Option<String>,
+}
+
+async fn login(
+    State(st): State<AppState>,
+    Extension(d): Extension<AuthedDevice>,
+    Json(req): Json<LoginReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (secret, method) = match (req.password, req.pin) {
+        (Some(p), None) => (p, Method::Password),
+        (None, Some(p)) => (p, Method::Pin),
+        _ => return Err(ApiError::BadRequest("send exactly one of password or pin")),
+    };
+    if req.username.len() > 64 || secret.is_empty() || secret.len() > 256 {
+        return Err(ApiError::BadRequest("username or secret has an invalid length"));
+    }
+    let tenant = st.tenant_id.to_string();
+    let device = d.0;
+    let username = req.username;
+    let out = db(&st, move |c| {
+        let now = now_utc(c)?;
+        Ok(match users::login(c, &tenant, &device, &username, &secret, method, &now) {
+            Ok(ok) => {
+                let perms = users::permissions_for_user(c, &tenant, &ok.user_id)?;
+                Ok((ok, perms))
+            }
+            Err(e) => Err(e),
+        })
+    })
+    .await?
+    .map_err(user_err)?;
+    let (ok, perms) = out;
+    Ok(Json(serde_json::json!({
+        "token": ok.token,
+        "expires_at": ok.expires_at,
+        "method": ok.method.as_str(),
+        "user": { "id": ok.user_id, "username": ok.username, "full_name": ok.full_name },
+        "permissions": perms,
+    })))
+}
+
+async fn logout(State(st): State<AppState>, Extension(p): Extension<Principal>) -> Result<StatusCode, ApiError> {
+    let tenant = st.tenant_id.to_string();
+    db(&st, move |c| {
+        let now = now_utc(c)?;
+        users::logout(c, &tenant, &p.session_id, &now)
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn me(Extension(p): Extension<Principal>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "user": { "id": p.user_id, "username": p.username, "full_name": p.full_name },
+        "method": p.method.as_str(),
+        "permissions": p.permissions,
+    }))
+}
+
+#[derive(Deserialize)]
+struct ChangePasswordReq {
+    current_password: String,
+    new_password: String,
+}
+
+async fn change_password(
+    State(st): State<AppState>,
+    Extension(d): Extension<AuthedDevice>,
+    Extension(p): Extension<Principal>,
+    Json(req): Json<ChangePasswordReq>,
+) -> Result<StatusCode, ApiError> {
+    if p.method != Method::Password {
+        return Err(ApiError::PasswordRequired);
+    }
+    if req.current_password.len() > 256 || req.new_password.len() > 512 {
+        return Err(ApiError::BadRequest("password is too long"));
+    }
+    let tenant = st.tenant_id.to_string();
+    db(&st, move |c| {
+        let now = now_utc(c)?;
+        Ok(users::change_password(c, &tenant, &p.user_id, Some(&d.0), &req.current_password, &req.new_password, &now))
+    })
+    .await?
+    .map_err(user_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct SetPinReq {
+    current_password: String,
+    pin: String,
+}
+
+async fn set_pin(
+    State(st): State<AppState>,
+    Extension(d): Extension<AuthedDevice>,
+    Extension(p): Extension<Principal>,
+    Json(req): Json<SetPinReq>,
+) -> Result<StatusCode, ApiError> {
+    if p.method != Method::Password {
+        return Err(ApiError::PasswordRequired);
+    }
+    if req.current_password.len() > 256 || req.pin.len() > 16 {
+        return Err(ApiError::BadRequest("value is too long"));
+    }
+    let tenant = st.tenant_id.to_string();
+    db(&st, move |c| {
+        let now = now_utc(c)?;
+        Ok(users::set_pin(c, &tenant, &p.user_id, Some(&d.0), &req.current_password, &req.pin, &now))
+    })
+    .await?
+    .map_err(user_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct CreateUserReq {
+    username: String,
+    full_name: String,
+    password: String,
+}
+
+async fn create_user(
+    State(st): State<AppState>,
+    Extension(d): Extension<AuthedDevice>,
+    Extension(p): Extension<Principal>,
+    Json(req): Json<CreateUserReq>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    if req.username.len() > 64 || req.full_name.len() > 256 || req.password.len() > 512 {
+        return Err(ApiError::BadRequest("value is too long"));
+    }
+    let tenant = st.tenant_id.to_string();
+    let pk = st.license_pubkey;
+    let id = db(&st, move |c| {
+        let max = match guard_user_admin(c, &tenant, &pk, &p)? {
+            Ok(m) => m,
+            Err(e) => return Ok(Err(e)),
+        };
+        if users::count_active_users(c, &tenant)? >= max {
+            return Ok(Err(ApiError::UserLimit));
+        }
+        let now = now_utc(c)?;
+        Ok(users::create_user(c, &tenant, Some(&p.user_id), Some(&d.0), &req.username, &req.full_name, &req.password, &now)
+            .map_err(user_err))
+    })
+    .await??;
+    Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
+}
+
+async fn deactivate_user(
+    State(st): State<AppState>,
+    Extension(d): Extension<AuthedDevice>,
+    Extension(p): Extension<Principal>,
+    Path(user_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let tenant = st.tenant_id.to_string();
+    let pk = st.license_pubkey;
+    db(&st, move |c| {
+        if let Err(e) = guard_user_admin(c, &tenant, &pk, &p)? {
+            return Ok(Err(e));
+        }
+        let now = now_utc(c)?;
+        Ok(users::deactivate_user(c, &tenant, &p.user_id, Some(&d.0), &user_id, &now).map_err(user_err))
+    })
+    .await??;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn health(State(st): State<AppState>) -> Json<serde_json::Value> {
@@ -238,9 +496,20 @@ async fn whoami(State(st): State<AppState>, Extension(d): Extension<AuthedDevice
 }
 
 pub fn router(state: AppState) -> Router {
+    // Routes that act as a signed-in user. `require_session` is added first so it runs after `require_device`.
+    let sessioned = Router::new()
+        .route("/v1/auth/logout", post(logout))
+        .route("/v1/me", get(me))
+        .route("/v1/me/password", post(change_password))
+        .route("/v1/me/pin", post(set_pin))
+        .route("/v1/users", post(create_user))
+        .route("/v1/users/:id/deactivate", post(deactivate_user))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_session));
     let authed = Router::new()
         .route("/v1/whoami", get(whoami))
         .route("/v1/license/status", get(license_status))
+        .route("/v1/auth/login", post(login))
+        .merge(sessioned)
         .route_layer(middleware::from_fn_with_state(state.clone(), require_device));
     let versioned = Router::new()
         .route("/v1/pair/redeem", post(redeem))
@@ -275,6 +544,8 @@ mod tests {
              INSERT INTO users(id,tenant_id,username,full_name) VALUES ('u1','t1','admin','Admin');",
         )
         .unwrap();
+        let boss = users::create_user(&mut c, "t1", None, None, "boss", "The Boss", PW, "2030-01-01T00:00:00.000Z").unwrap();
+        users::grant_owner(&mut c, "t1", &boss).unwrap();
         if let Some(name) = envelope {
             let (p, s) = testvec::env(&vecs, name);
             crate::entitlement::apply(&mut c, "t1", &p, &s, &pk).unwrap();
@@ -310,6 +581,7 @@ mod tests {
     }
 
     const V1: (&str, &str) = ("x-api-version", "1");
+    const PW: &str = "correct horse battery";
 
     async fn pair(app: &Router, code: &str) -> (StatusCode, serde_json::Value) {
         let body = format!(r#"{{"code":"{code}","device_name":"Counter PC"}}"#);
@@ -526,5 +798,284 @@ mod tests {
         let (p, s) = (t["payload_b64"].as_str().unwrap().to_string(), t["signature_b64"].as_str().unwrap().to_string());
         let r = writer.run(move |c| Ok(crate::entitlement::apply(c, "t1", &p, &s, &pk))).unwrap();
         assert!(matches!(r, Err(crate::entitlement::EntError::BadSignature)));
+    }
+
+    // ---------- users, login and sessions ----------
+
+    fn bearer(token: &str) -> String {
+        format!("Bearer {token}")
+    }
+
+    fn authed<'a>(id: &'a str, secret: &'a str, bearer: &'a str) -> Vec<(&'a str, &'a str)> {
+        let mut h = creds(id, secret);
+        h.push(("authorization", bearer));
+        h
+    }
+
+    async fn sign_in(app: &Router, id: &str, secret: &str, user: &str, pw: &str) -> (StatusCode, serde_json::Value) {
+        let body = serde_json::json!({ "username": user, "password": pw }).to_string();
+        call(app, req("POST", "/v1/auth/login", &creds(id, secret), Some(&body))).await
+    }
+
+    /// A paired device and a signed-in owner token.
+    async fn owner_session(app: &Router, writer: &Arc<Writer>) -> (String, String, String) {
+        let code = new_code(writer);
+        let (id, secret) = paired(app, &code).await;
+        let (s, v) = sign_in(app, &id, &secret, "boss", PW).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        (id, secret, v["token"].as_str().unwrap().to_string())
+    }
+
+    async fn post_json(app: &Router, uri: &str, h: &[(&str, &str)], body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        call(app, req("POST", uri, h, Some(&body.to_string()))).await
+    }
+
+    #[tokio::test]
+    async fn login_needs_a_paired_device_first() {
+        let (app, _, _) = make();
+        let body = serde_json::json!({ "username": "boss", "password": PW }).to_string();
+        let (s, e) = call(&app, req("POST", "/v1/auth/login", &[V1], Some(&body))).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        assert_eq!(e["error"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn login_returns_a_token_and_permissions_and_never_a_hash() {
+        let (app, writer, _) = make();
+        let code = new_code(&writer);
+        let (id, secret) = paired(&app, &code).await;
+        let (s, v) = sign_in(&app, &id, &secret, "Boss", PW).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["user"]["username"], "boss");
+        assert_eq!(v["method"], "password");
+        assert_eq!(v["permissions"], serde_json::json!(["*"]));
+        assert_eq!(v["token"].as_str().unwrap().len(), 64);
+        assert!(!v.to_string().contains("argon2"));
+        let b = bearer(v["token"].as_str().unwrap());
+        let (s, m) = call(&app, req("GET", "/v1/me", &authed(&id, &secret, &b), None)).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(m["user"]["full_name"], "The Boss");
+    }
+
+    #[tokio::test]
+    async fn wrong_password_and_unknown_user_get_the_same_answer() {
+        let (app, writer, _) = make();
+        let code = new_code(&writer);
+        let (id, secret) = paired(&app, &code).await;
+        let (s1, e1) = sign_in(&app, &id, &secret, "boss", "wrong password!").await;
+        let (s2, e2) = sign_in(&app, &id, &secret, "nobody", "wrong password!").await;
+        assert_eq!((s1, s2), (StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED));
+        assert_eq!(e1, e2);
+        assert_eq!(e1["error"], "invalid_credentials");
+    }
+
+    #[tokio::test]
+    async fn login_body_must_have_exactly_one_secret() {
+        let (app, writer, _) = make();
+        let code = new_code(&writer);
+        let (id, secret) = paired(&app, &code).await;
+        for body in [
+            serde_json::json!({ "username": "boss" }),
+            serde_json::json!({ "username": "boss", "password": PW, "pin": "2580" }),
+            serde_json::json!({ "username": "boss", "password": "" }),
+        ] {
+            let (s, _) = post_json(&app, "/v1/auth/login", &creds(&id, &secret), body).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn five_wrong_passwords_lock_the_account_even_for_the_right_one() {
+        let (app, writer, _) = make();
+        let code = new_code(&writer);
+        let (id, secret) = paired(&app, &code).await;
+        for _ in 0..5 {
+            let (s, _) = sign_in(&app, &id, &secret, "boss", "wrong password!").await;
+            assert_eq!(s, StatusCode::UNAUTHORIZED);
+        }
+        let (s, e) = sign_in(&app, &id, &secret, "boss", PW).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        assert_eq!(e["error"], "invalid_credentials");
+    }
+
+    #[tokio::test]
+    async fn session_routes_need_a_valid_token_from_the_same_device() {
+        let (app, writer, _) = make();
+        let (id, secret, token) = owner_session(&app, &writer).await;
+        // no token / garbage token / wrong scheme
+        for h in [None, Some("Bearer nonsense"), Some("Basic abc"), Some("Bearer ")] {
+            let mut hdr = creds(&id, &secret);
+            if let Some(v) = h {
+                hdr.push(("authorization", v));
+            }
+            let (s, e) = call(&app, req("GET", "/v1/me", &hdr, None)).await;
+            assert_eq!(s, StatusCode::UNAUTHORIZED, "{h:?}");
+            assert_eq!(e["error"], "session_required");
+        }
+        // a second paired device cannot use the first device's token
+        let code2 = new_code(&writer);
+        let (id2, secret2) = paired(&app, &code2).await;
+        let b = bearer(&token);
+        let (s, _) = call(&app, req("GET", "/v1/me", &authed(&id2, &secret2, &b), None)).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        // and the device credentials alone are not enough for a session route
+        let (s, _) = call(&app, req("GET", "/v1/me", &creds(&id, &secret), None)).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        // existing device-only route is unchanged
+        let (s, _) = call(&app, req("GET", "/v1/whoami", &creds(&id, &secret), None)).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn logout_ends_the_session() {
+        let (app, writer, _) = make();
+        let (id, secret, token) = owner_session(&app, &writer).await;
+        let b = bearer(&token);
+        let (s, _) = call(&app, req("POST", "/v1/auth/logout", &authed(&id, &secret, &b), None)).await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        let (s, _) = call(&app, req("GET", "/v1/me", &authed(&id, &secret, &b), None)).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn an_owner_creates_a_user_who_can_then_sign_in() {
+        let (app, writer, _) = make();
+        let (id, secret, token) = owner_session(&app, &writer).await;
+        let b = bearer(&token);
+        let body = serde_json::json!({ "username": "Clerk1", "full_name": "Clerk One", "password": "clerk password 1" });
+        let (s, v) = post_json(&app, "/v1/users", &authed(&id, &secret, &b), body.clone()).await;
+        assert_eq!(s, StatusCode::CREATED, "{v}");
+        assert!(v["id"].as_str().is_some());
+        let (s, e) = post_json(&app, "/v1/users", &authed(&id, &secret, &b), body).await;
+        assert_eq!((s, e["error"].as_str()), (StatusCode::CONFLICT, Some("conflict")));
+        let (s, l) = sign_in(&app, &id, &secret, "clerk1", "clerk password 1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(l["permissions"], serde_json::json!([]), "new users have no permissions until given a role");
+        let weak = serde_json::json!({ "username": "weak", "full_name": "W", "password": "short" });
+        let (s, _) = post_json(&app, "/v1/users", &authed(&id, &secret, &b), weak).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_user_without_users_manage_is_forbidden_even_with_a_password_session() {
+        let (app, writer, _) = make();
+        let (id, secret, token) = owner_session(&app, &writer).await;
+        let b = bearer(&token);
+        let body = serde_json::json!({ "username": "clerk1", "full_name": "Clerk", "password": "clerk password 1" });
+        post_json(&app, "/v1/users", &authed(&id, &secret, &b), body).await;
+        let (_, l) = sign_in(&app, &id, &secret, "clerk1", "clerk password 1").await;
+        let cb = bearer(l["token"].as_str().unwrap());
+        let body = serde_json::json!({ "username": "other", "full_name": "O", "password": "other password 1" });
+        let (s, e) = post_json(&app, "/v1/users", &authed(&id, &secret, &cb), body).await;
+        assert_eq!((s, e["error"].as_str()), (StatusCode::FORBIDDEN, Some("forbidden")));
+    }
+
+    #[tokio::test]
+    async fn a_pin_session_cannot_manage_users_or_change_credentials() {
+        let (app, writer, _) = make();
+        let (id, secret, token) = owner_session(&app, &writer).await;
+        let b = bearer(&token);
+        let (s, _) = post_json(&app, "/v1/me/pin", &authed(&id, &secret, &b), serde_json::json!({ "current_password": "wrong password!", "pin": "2580" })).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "setting a PIN needs the current password");
+        let (s, _) = post_json(&app, "/v1/me/pin", &authed(&id, &secret, &b), serde_json::json!({ "current_password": PW, "pin": "1234567890" })).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = post_json(&app, "/v1/me/pin", &authed(&id, &secret, &b), serde_json::json!({ "current_password": PW, "pin": "2580" })).await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+
+        let (s, l) = post_json(&app, "/v1/auth/login", &creds(&id, &secret), serde_json::json!({ "username": "boss", "pin": "2580" })).await;
+        assert_eq!((s, l["method"].as_str()), (StatusCode::OK, Some("pin")));
+        let pb = bearer(l["token"].as_str().unwrap());
+        let (s, m) = call(&app, req("GET", "/v1/me", &authed(&id, &secret, &pb), None)).await;
+        assert_eq!((s, m["method"].as_str()), (StatusCode::OK, Some("pin")));
+
+        let new_user = serde_json::json!({ "username": "sneaky", "full_name": "S", "password": "sneaky password 1" });
+        let (s, e) = post_json(&app, "/v1/users", &authed(&id, &secret, &pb), new_user).await;
+        assert_eq!((s, e["error"].as_str()), (StatusCode::FORBIDDEN, Some("password_login_required")));
+        let chg = serde_json::json!({ "current_password": PW, "new_password": "attacker chosen password" });
+        let (s, e) = post_json(&app, "/v1/me/password", &authed(&id, &secret, &pb), chg).await;
+        assert_eq!((s, e["error"].as_str()), (StatusCode::FORBIDDEN, Some("password_login_required")));
+    }
+
+    #[tokio::test]
+    async fn changing_the_password_signs_everyone_out() {
+        let (app, writer, _) = make();
+        let (id, secret, token) = owner_session(&app, &writer).await;
+        let b = bearer(&token);
+        let bad = serde_json::json!({ "current_password": "wrong password!", "new_password": "a brand new password" });
+        let (s, _) = post_json(&app, "/v1/me/password", &authed(&id, &secret, &b), bad).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        let ok = serde_json::json!({ "current_password": PW, "new_password": "a brand new password" });
+        let (s, _) = post_json(&app, "/v1/me/password", &authed(&id, &secret, &b), ok).await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        let (s, _) = call(&app, req("GET", "/v1/me", &authed(&id, &secret, &b), None)).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        assert_eq!(sign_in(&app, &id, &secret, "boss", PW).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(sign_in(&app, &id, &secret, "boss", "a brand new password").await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn deactivating_a_user_signs_them_out_and_the_last_owner_is_protected() {
+        let (app, writer, _) = make();
+        let (id, secret, token) = owner_session(&app, &writer).await;
+        let b = bearer(&token);
+        let body = serde_json::json!({ "username": "clerk1", "full_name": "Clerk", "password": "clerk password 1" });
+        let (_, created) = post_json(&app, "/v1/users", &authed(&id, &secret, &b), body).await;
+        let clerk_id = created["id"].as_str().unwrap().to_string();
+        let (_, l) = sign_in(&app, &id, &secret, "clerk1", "clerk password 1").await;
+        let cb = bearer(l["token"].as_str().unwrap());
+
+        let uri = format!("/v1/users/{clerk_id}/deactivate");
+        let (s, _) = call(&app, req("POST", &uri, &authed(&id, &secret, &b), None)).await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        let (s, _) = call(&app, req("GET", "/v1/me", &authed(&id, &secret, &cb), None)).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        assert_eq!(sign_in(&app, &id, &secret, "clerk1", "clerk password 1").await.0, StatusCode::UNAUTHORIZED);
+
+        let boss_id = writer
+            .run(|c| Ok(c.query_row("SELECT id FROM users WHERE username='boss'", [], |r| r.get::<_, String>(0))?))
+            .unwrap();
+        let (s, e) = call(&app, req("POST", &format!("/v1/users/{boss_id}/deactivate"), &authed(&id, &secret, &b), None)).await;
+        assert_eq!((s, e["error"].as_str()), (StatusCode::CONFLICT, Some("conflict")));
+        let (s, _) = call(&app, req("POST", "/v1/users/no-such-user/deactivate", &authed(&id, &secret, &b), None)).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_plan_user_limit_is_enforced() {
+        let (app, writer, _) = make();
+        let (id, secret, token) = owner_session(&app, &writer).await;
+        let b = bearer(&token);
+        // plan allows 10 users; u1 and boss exist, add 8 more directly
+        writer
+            .run(|c| {
+                for i in 0..8 {
+                    c.execute(
+                        "INSERT INTO users(id,tenant_id,username,full_name) VALUES (?1,'t1',?2,'Filler')",
+                        dsaas_db::rusqlite::params![format!("f{i}"), format!("filler{i}")],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let body = serde_json::json!({ "username": "oneover", "full_name": "Over", "password": "over the limit 1" });
+        let (s, e) = post_json(&app, "/v1/users", &authed(&id, &secret, &b), body).await;
+        assert_eq!((s, e["error"].as_str()), (StatusCode::FORBIDDEN, Some("user_limit_reached")));
+    }
+
+    #[tokio::test]
+    async fn suspension_blocks_creating_users_but_not_signing_in() {
+        let (app, writer, _) = make();
+        let (id, secret, token) = owner_session(&app, &writer).await;
+        let b = bearer(&token);
+        apply_env(&writer, "suspended_rev2").unwrap();
+        let body = serde_json::json!({ "username": "newhire", "full_name": "New", "password": "new hire password" });
+        let (s, e) = post_json(&app, "/v1/users", &authed(&id, &secret, &b), body).await;
+        assert_eq!((s, e["error"].as_str()), (StatusCode::PAYMENT_REQUIRED, Some("subscription_inactive")));
+        // owners can still sign in, read, and sign out of a suspended shop
+        assert_eq!(sign_in(&app, &id, &secret, "boss", PW).await.0, StatusCode::OK);
+        let (s, _) = call(&app, req("GET", "/v1/me", &authed(&id, &secret, &b), None)).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(&app, req("POST", "/v1/auth/logout", &authed(&id, &secret, &b), None)).await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
     }
 }

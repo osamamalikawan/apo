@@ -10,8 +10,8 @@ panel that can revoke subscriptions remotely. Read `docs/adr/` for the why; `STA
 |---|---|---|---|
 | Domain rules (TS) | `packages/domain` | money, permissions, reference stock ledger, entitlement rules | its README |
 | Shared test vectors | `packages/test-vectors` | JSON cases every language must pass | its README |
-| Shop DB (Rust + SQLite) | `apps/desktop/src-tauri/crates/db` | migrations, single writer, device pairing | its README |
-| Shop API (Rust) | `apps/desktop/src-tauri/crates/lan-api` | HTTPS API, device auth, TLS, subscription enforcement | its README |
+| Shop DB (Rust + SQLite) | `apps/desktop/src-tauri/crates/db` | migrations, single writer, device pairing, users/login/sessions | its README |
+| Shop API (Rust) | `apps/desktop/src-tauri/crates/lan-api` | HTTPS API, device auth, user sessions, TLS, subscription enforcement | its README |
 | Cloud (Postgres) | `supabase/` | schema, RLS, RPCs, Super Admin functions, SQL tests | its README |
 | Dev tools | `tools/` | SQLite test runner, dev license signer, vector generator | its README |
 | Cloudflare Worker | `services/worker` | **not started** (signs entitlements, sync gateway) | ADR 0003, 0006 |
@@ -51,7 +51,7 @@ reach it). 3. Rules in `packages/domain` + vectors. 4. Service functions in `cra
 6. Sync: write the outbox row in the same transaction as the change. 7. Tests at every layer; update `STATUS.md`.
 
 ## Suggested build order (dependencies first)
-1. Users and login on the LAN server (Argon2id, sessions, PIN) 2. Roles/permissions tables + a shared authorization
+1. ~~Users and login on the LAN server (Argon2id, sessions, PIN)~~ **done, see ADR 0007** 2. Roles/permissions tables + a shared authorization
 middleware (permission + location/route scope + entitlement) 3. Master data: locations, products, customers
 4. Inventory service: transfers, counts, reservations (spec in the original multi-location brief)
 5. Sales, payments, accounts ledger 6. Sync engine (outbox/inbox, hourly + manual, conflicts)
@@ -68,4 +68,5 @@ middleware (permission + location/route scope + entitlement) 3. Master data: loc
 | `apps\desktop\src-tauri` | `cargo test -p dsaas-db` and `cargo test -p dsaas-lan-api` |
 | `apps\desktop\src-tauri` | `cargo run -p dsaas-lan-api --bin lan-server -- [--lan] [--apply-entitlement file]` |
 | Supabase SQL Editor | paste `supabase/migrations/000N_*.sql`, then the matching file in `supabase/tests/` |
+Rust must be 1.78+ (Cargo.lock is version 4). The first `cargo test` is slow while crates compile.
 Windows notes: use `curl.exe` (not `curl`); do not use `>` to write JSON (UTF-16): use the tool's `--out` flag.

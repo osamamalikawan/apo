@@ -1,10 +1,10 @@
-//! Shop Server database access. NOT YET COMPILED in this environment (no Rust toolchain);
-//! see STATUS.md. The SQL it runs is tested separately by tools/test_sqlite_ledger.py.
+//! Shop Server database access. The SQL it runs is also tested by tools/test_sqlite_ledger.py.
 //!
 //! Rules: only the server process opens this file; all writes go through one writer thread;
 //! migrations run inside a transaction after a backup.
 
 pub mod pairing;
+pub mod users;
 pub use rusqlite;
 
 use rusqlite::Connection;
@@ -40,6 +40,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "entitlements",
         sql: include_str!("../migrations/0003_entitlements.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "users_sessions",
+        sql: include_str!("../migrations/0004_users_sessions.sql"),
     },
 ];
 
@@ -137,8 +142,8 @@ mod tests {
     #[test]
     fn migrates_once_and_is_idempotent() {
         let mut c = open_in_memory().unwrap();
-        assert_eq!(migrate(&mut c).unwrap(), vec![1, 2, 3]);
-        assert_eq!(current_version(&c).unwrap(), 3);
+        assert_eq!(migrate(&mut c).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(current_version(&c).unwrap(), 4);
         assert!(migrate(&mut c).unwrap().is_empty());
     }
 

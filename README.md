@@ -21,7 +21,7 @@ git apply some.patch
 ## Run the tests that work today
 ```
 tsc -p packages/domain/tsconfig.json                  # typecheck
-node --test packages/domain/test/domain.test.ts       # domain tests (Node 22+)
+node --experimental-strip-types --test packages/domain/test/domain.test.ts   # domain tests (Node 22.14; plain `node --test` works on 22.18+)
 python3 tools/test_sqlite_ledger.py                   # real SQLite schema tests
 node tools/gen-entitlement-vectors.mjs                # regenerate signed test vectors (deterministic)
 ```
