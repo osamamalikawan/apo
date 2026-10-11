@@ -1,0 +1,37 @@
+{
+  "contexts": {
+    "cashier_main": {
+      "permissions": ["sales.view", "sales.create", "inventory.view"],
+      "allLocations": false, "locationIds": ["main"], "allRoutes": true, "routeIds": []
+    },
+    "warehouse_worker": {
+      "permissions": ["inventory.view", "inventory.transfer"],
+      "allLocations": false, "locationIds": ["g1", "g2"], "allRoutes": true, "routeIds": []
+    },
+    "inventory_manager": {
+      "permissions": ["inventory.*"],
+      "allLocations": true, "locationIds": [], "allRoutes": true, "routeIds": []
+    },
+    "salesman_r1": {
+      "permissions": ["sales.create", "customers.view"],
+      "allLocations": false, "locationIds": ["main"], "allRoutes": false, "routeIds": ["r1"]
+    },
+    "admin": {
+      "permissions": ["*"],
+      "allLocations": true, "locationIds": [], "allRoutes": true, "routeIds": []
+    }
+  },
+  "cases": [
+    {"ctx": "cashier_main", "perm": "sales.create", "scope": {"locationId": "main"}, "allowed": true},
+    {"ctx": "cashier_main", "perm": "sales.create", "scope": {"locationId": "g1"}, "allowed": false, "reason": "location_denied"},
+    {"ctx": "cashier_main", "perm": "inventory.adjust", "scope": {"locationId": "main"}, "allowed": false, "reason": "no_permission"},
+    {"ctx": "warehouse_worker", "perm": "inventory.transfer", "scope": {"locationId": "g2"}, "allowed": true},
+    {"ctx": "warehouse_worker", "perm": "inventory.transfer", "scope": {"locationId": "main"}, "allowed": false, "reason": "location_denied"},
+    {"ctx": "inventory_manager", "perm": "inventory.adjust", "scope": {"locationId": "anything"}, "allowed": true},
+    {"ctx": "inventory_manager", "perm": "sales.create", "scope": {}, "allowed": false, "reason": "no_permission"},
+    {"ctx": "salesman_r1", "perm": "sales.create", "scope": {"routeId": "r1", "locationId": "main"}, "allowed": true},
+    {"ctx": "salesman_r1", "perm": "sales.create", "scope": {"routeId": "r2"}, "allowed": false, "reason": "route_denied"},
+    {"ctx": "admin", "perm": "users.manage", "scope": {"locationId": "x", "routeId": "y"}, "allowed": true},
+    {"ctx": "cashier_main", "perm": "sales.createx", "scope": {}, "allowed": false, "reason": "no_permission"}
+  ]
+}

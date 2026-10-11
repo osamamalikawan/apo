@@ -1,0 +1,310 @@
+{
+  "public_key_b64": "WxqE929qPN3MFhvR97ZQg+VluUYcYd+8p9zl4wZGUKY=",
+  "other_public_key_b64": "PjJV3UoEGrYspPfyGw/9/cOU9QsmS6L3ZKu3/mgJcs0=",
+  "envelopes": {
+    "active_rev1": {
+      "payload": {
+        "tenant_id": "t1",
+        "revision": 1,
+        "status": "active",
+        "issued_at": "2026-10-01T00:00:00Z",
+        "full_until": "2099-12-31T00:00:00Z",
+        "grace_until": "2100-01-07T00:00:00Z",
+        "limits": {
+          "max_devices": 2,
+          "max_users": 10,
+          "max_locations": 5
+        },
+        "modules": [
+          "sales",
+          "inventory"
+        ]
+      },
+      "payload_b64": "eyJ0ZW5hbnRfaWQiOiJ0MSIsInJldmlzaW9uIjoxLCJzdGF0dXMiOiJhY3RpdmUiLCJpc3N1ZWRfYXQiOiIyMDI2LTEwLTAxVDAwOjAwOjAwWiIsImZ1bGxfdW50aWwiOiIyMDk5LTEyLTMxVDAwOjAwOjAwWiIsImdyYWNlX3VudGlsIjoiMjEwMC0wMS0wN1QwMDowMDowMFoiLCJsaW1pdHMiOnsibWF4X2RldmljZXMiOjIsIm1heF91c2VycyI6MTAsIm1heF9sb2NhdGlvbnMiOjV9LCJtb2R1bGVzIjpbInNhbGVzIiwiaW52ZW50b3J5Il19",
+      "signature_b64": "4DWiQJ+PpjZcuAngFIyDRaqktgqtKhFGr4OI0EcfBdNslShwgdWOtj4jlQUvOxA3JMP+kJA0KyVRQzYfACpXBw=="
+    },
+    "active_rev1_older": {
+      "payload": {
+        "tenant_id": "t1",
+        "revision": 1,
+        "status": "active",
+        "issued_at": "2026-09-01T00:00:00Z",
+        "full_until": "2099-12-31T00:00:00Z",
+        "grace_until": "2100-01-07T00:00:00Z",
+        "limits": {
+          "max_devices": 2,
+          "max_users": 10,
+          "max_locations": 5
+        },
+        "modules": [
+          "sales",
+          "inventory"
+        ]
+      },
+      "payload_b64": "eyJ0ZW5hbnRfaWQiOiJ0MSIsInJldmlzaW9uIjoxLCJzdGF0dXMiOiJhY3RpdmUiLCJpc3N1ZWRfYXQiOiIyMDI2LTA5LTAxVDAwOjAwOjAwWiIsImZ1bGxfdW50aWwiOiIyMDk5LTEyLTMxVDAwOjAwOjAwWiIsImdyYWNlX3VudGlsIjoiMjEwMC0wMS0wN1QwMDowMDowMFoiLCJsaW1pdHMiOnsibWF4X2RldmljZXMiOjIsIm1heF91c2VycyI6MTAsIm1heF9sb2NhdGlvbnMiOjV9LCJtb2R1bGVzIjpbInNhbGVzIiwiaW52ZW50b3J5Il19",
+      "signature_b64": "EmPNuJKBVIbFXF81vg9PJBwNiuFOyzlOMLvDUMMwThnDSXBHoxg9AVkdhVNKB7HoKHFMmLxx+ljUmZATuYdUAQ=="
+    },
+    "active_rev1_newer": {
+      "payload": {
+        "tenant_id": "t1",
+        "revision": 1,
+        "status": "active",
+        "issued_at": "2026-10-05T00:00:00Z",
+        "full_until": "2099-12-31T00:00:00Z",
+        "grace_until": "2100-01-07T00:00:00Z",
+        "limits": {
+          "max_devices": 2,
+          "max_users": 10,
+          "max_locations": 5
+        },
+        "modules": [
+          "sales",
+          "inventory"
+        ]
+      },
+      "payload_b64": "eyJ0ZW5hbnRfaWQiOiJ0MSIsInJldmlzaW9uIjoxLCJzdGF0dXMiOiJhY3RpdmUiLCJpc3N1ZWRfYXQiOiIyMDI2LTEwLTA1VDAwOjAwOjAwWiIsImZ1bGxfdW50aWwiOiIyMDk5LTEyLTMxVDAwOjAwOjAwWiIsImdyYWNlX3VudGlsIjoiMjEwMC0wMS0wN1QwMDowMDowMFoiLCJsaW1pdHMiOnsibWF4X2RldmljZXMiOjIsIm1heF91c2VycyI6MTAsIm1heF9sb2NhdGlvbnMiOjV9LCJtb2R1bGVzIjpbInNhbGVzIiwiaW52ZW50b3J5Il19",
+      "signature_b64": "Vjo9UT4XaV7mKqOymEK7zIQJ39qL4+SZAUrcrDbus2qpuQVEk8xt1MyXb9mlgP2ceex6h8X6AuTtoakRnOL2Dg=="
+    },
+    "suspended_rev2": {
+      "payload": {
+        "tenant_id": "t1",
+        "revision": 2,
+        "status": "suspended",
+        "issued_at": "2026-10-01T00:00:00Z",
+        "full_until": "2099-12-31T00:00:00Z",
+        "grace_until": "2100-01-07T00:00:00Z",
+        "limits": {
+          "max_devices": 2,
+          "max_users": 10,
+          "max_locations": 5
+        },
+        "modules": [
+          "sales",
+          "inventory"
+        ]
+      },
+      "payload_b64": "eyJ0ZW5hbnRfaWQiOiJ0MSIsInJldmlzaW9uIjoyLCJzdGF0dXMiOiJzdXNwZW5kZWQiLCJpc3N1ZWRfYXQiOiIyMDI2LTEwLTAxVDAwOjAwOjAwWiIsImZ1bGxfdW50aWwiOiIyMDk5LTEyLTMxVDAwOjAwOjAwWiIsImdyYWNlX3VudGlsIjoiMjEwMC0wMS0wN1QwMDowMDowMFoiLCJsaW1pdHMiOnsibWF4X2RldmljZXMiOjIsIm1heF91c2VycyI6MTAsIm1heF9sb2NhdGlvbnMiOjV9LCJtb2R1bGVzIjpbInNhbGVzIiwiaW52ZW50b3J5Il19",
+      "signature_b64": "joNpSm9Xfv3ZcrRqmRZ9R+EMoLq6jwM2/iWXn7Ko4CpQ4Vjs/Rpy7DdjtMdDnxnxf1fMIWxwBGb8q8sCf+LNCQ=="
+    },
+    "active_rev3": {
+      "payload": {
+        "tenant_id": "t1",
+        "revision": 3,
+        "status": "active",
+        "issued_at": "2026-10-01T00:00:00Z",
+        "full_until": "2099-12-31T00:00:00Z",
+        "grace_until": "2100-01-07T00:00:00Z",
+        "limits": {
+          "max_devices": 2,
+          "max_users": 10,
+          "max_locations": 5
+        },
+        "modules": [
+          "sales",
+          "inventory"
+        ]
+      },
+      "payload_b64": "eyJ0ZW5hbnRfaWQiOiJ0MSIsInJldmlzaW9uIjozLCJzdGF0dXMiOiJhY3RpdmUiLCJpc3N1ZWRfYXQiOiIyMDI2LTEwLTAxVDAwOjAwOjAwWiIsImZ1bGxfdW50aWwiOiIyMDk5LTEyLTMxVDAwOjAwOjAwWiIsImdyYWNlX3VudGlsIjoiMjEwMC0wMS0wN1QwMDowMDowMFoiLCJsaW1pdHMiOnsibWF4X2RldmljZXMiOjIsIm1heF91c2VycyI6MTAsIm1heF9sb2NhdGlvbnMiOjV9LCJtb2R1bGVzIjpbInNhbGVzIiwiaW52ZW50b3J5Il19",
+      "signature_b64": "sZNaY0bfyhc7z0DrHF97Ha2jNm16tYfsWM8zjPCPFxJ5SyqLjxk1y485LpimjyuZfr7ZwecYFgoznp37UWpVCQ=="
+    },
+    "expired_rev1": {
+      "payload": {
+        "tenant_id": "t1",
+        "revision": 1,
+        "status": "active",
+        "issued_at": "2026-10-01T00:00:00Z",
+        "full_until": "2020-01-01T00:00:00Z",
+        "grace_until": "2020-01-08T00:00:00Z",
+        "limits": {
+          "max_devices": 2,
+          "max_users": 10,
+          "max_locations": 5
+        },
+        "modules": [
+          "sales",
+          "inventory"
+        ]
+      },
+      "payload_b64": "eyJ0ZW5hbnRfaWQiOiJ0MSIsInJldmlzaW9uIjoxLCJzdGF0dXMiOiJhY3RpdmUiLCJpc3N1ZWRfYXQiOiIyMDI2LTEwLTAxVDAwOjAwOjAwWiIsImZ1bGxfdW50aWwiOiIyMDIwLTAxLTAxVDAwOjAwOjAwWiIsImdyYWNlX3VudGlsIjoiMjAyMC0wMS0wOFQwMDowMDowMFoiLCJsaW1pdHMiOnsibWF4X2RldmljZXMiOjIsIm1heF91c2VycyI6MTAsIm1heF9sb2NhdGlvbnMiOjV9LCJtb2R1bGVzIjpbInNhbGVzIiwiaW52ZW50b3J5Il19",
+      "signature_b64": "iMvb5i38eZcukwmJliSpkCvFZUNVIcvpKPnSpHaycJcgWXc117bx/BDlz8DHwFl0lm9szi11HRj7NPUBYjwZAA=="
+    },
+    "wrong_tenant": {
+      "payload": {
+        "tenant_id": "other",
+        "revision": 1,
+        "status": "active",
+        "issued_at": "2026-10-01T00:00:00Z",
+        "full_until": "2099-12-31T00:00:00Z",
+        "grace_until": "2100-01-07T00:00:00Z",
+        "limits": {
+          "max_devices": 2,
+          "max_users": 10,
+          "max_locations": 5
+        },
+        "modules": [
+          "sales",
+          "inventory"
+        ]
+      },
+      "payload_b64": "eyJ0ZW5hbnRfaWQiOiJvdGhlciIsInJldmlzaW9uIjoxLCJzdGF0dXMiOiJhY3RpdmUiLCJpc3N1ZWRfYXQiOiIyMDI2LTEwLTAxVDAwOjAwOjAwWiIsImZ1bGxfdW50aWwiOiIyMDk5LTEyLTMxVDAwOjAwOjAwWiIsImdyYWNlX3VudGlsIjoiMjEwMC0wMS0wN1QwMDowMDowMFoiLCJsaW1pdHMiOnsibWF4X2RldmljZXMiOjIsIm1heF91c2VycyI6MTAsIm1heF9sb2NhdGlvbnMiOjV9LCJtb2R1bGVzIjpbInNhbGVzIiwiaW52ZW50b3J5Il19",
+      "signature_b64": "Ttch58OQxfR9KFkrn94qGapM8XSPd79PciGWbzHYuVShergYu8SoSQtW/wtFWUbGQ06/uC482vJXWWKh4216Dw=="
+    }
+  },
+  "tampered": {
+    "payload_b64": "eyJ0ZW5hbnRfaWQiOiJ0MSIsInJldmlzaW9uIjoxLCJzdGF0dXMiOiJhY3RpdmUiLCJpc3N1ZWRfYXQiOiIyMDI2LTEwLTAxVDAwOjAwOjAwWiIsImZ1bGxfdW50aWwiOiIyMTk5LTEyLTMxVDAwOjAwOjAwWiIsImdyYWNlX3VudGlsIjoiMjEwMC0wMS0wN1QwMDowMDowMFoiLCJsaW1pdHMiOnsibWF4X2RldmljZXMiOjIsIm1heF91c2VycyI6MTAsIm1heF9sb2NhdGlvbnMiOjV9LCJtb2R1bGVzIjpbInNhbGVzIiwiaW52ZW50b3J5Il19",
+    "signature_b64": "4DWiQJ+PpjZcuAngFIyDRaqktgqtKhFGr4OI0EcfBdNslShwgdWOtj4jlQUvOxA3JMP+kJA0KyVRQzYfACpXBw=="
+  },
+  "evaluation_cases": [
+    {
+      "name": "no entitlement",
+      "ent": null,
+      "now": "2026-10-10T00:00:00Z",
+      "high_water": null,
+      "mode": "unlicensed",
+      "reason": "no_entitlement"
+    },
+    {
+      "name": "active within period",
+      "ent": {
+        "tenant_id": "t1",
+        "status": "active",
+        "full_until": "2026-11-01T00:00:00Z",
+        "grace_until": "2026-11-08T00:00:00Z"
+      },
+      "now": "2026-10-10T00:00:00Z",
+      "high_water": null,
+      "mode": "full",
+      "reason": "active"
+    },
+    {
+      "name": "full_until is inclusive",
+      "ent": {
+        "tenant_id": "t1",
+        "status": "active",
+        "full_until": "2026-11-01T00:00:00Z",
+        "grace_until": "2026-11-08T00:00:00Z"
+      },
+      "now": "2026-11-01T00:00:00Z",
+      "high_water": null,
+      "mode": "full",
+      "reason": "active"
+    },
+    {
+      "name": "one second after period -> grace",
+      "ent": {
+        "tenant_id": "t1",
+        "status": "active",
+        "full_until": "2026-11-01T00:00:00Z",
+        "grace_until": "2026-11-08T00:00:00Z"
+      },
+      "now": "2026-11-01T00:00:01Z",
+      "high_water": null,
+      "mode": "grace",
+      "reason": "grace_period"
+    },
+    {
+      "name": "grace_until is inclusive",
+      "ent": {
+        "tenant_id": "t1",
+        "status": "active",
+        "full_until": "2026-11-01T00:00:00Z",
+        "grace_until": "2026-11-08T00:00:00Z"
+      },
+      "now": "2026-11-08T00:00:00Z",
+      "high_water": null,
+      "mode": "grace",
+      "reason": "grace_period"
+    },
+    {
+      "name": "after grace -> read only",
+      "ent": {
+        "tenant_id": "t1",
+        "status": "active",
+        "full_until": "2026-11-01T00:00:00Z",
+        "grace_until": "2026-11-08T00:00:00Z"
+      },
+      "now": "2026-11-08T00:00:01Z",
+      "high_water": null,
+      "mode": "read_only",
+      "reason": "expired"
+    },
+    {
+      "name": "suspended beats valid dates",
+      "ent": {
+        "tenant_id": "t1",
+        "status": "suspended",
+        "full_until": "2026-11-01T00:00:00Z",
+        "grace_until": "2026-11-08T00:00:00Z"
+      },
+      "now": "2026-10-10T00:00:00Z",
+      "high_water": null,
+      "mode": "read_only",
+      "reason": "suspended"
+    },
+    {
+      "name": "cancelled",
+      "ent": {
+        "tenant_id": "t1",
+        "status": "cancelled",
+        "full_until": "2026-11-01T00:00:00Z",
+        "grace_until": "2026-11-08T00:00:00Z"
+      },
+      "now": "2026-10-10T00:00:00Z",
+      "high_water": null,
+      "mode": "read_only",
+      "reason": "cancelled"
+    },
+    {
+      "name": "another tenant's entitlement",
+      "ent": {
+        "tenant_id": "other",
+        "status": "active",
+        "full_until": "2026-11-01T00:00:00Z",
+        "grace_until": "2026-11-08T00:00:00Z"
+      },
+      "now": "2026-10-10T00:00:00Z",
+      "high_water": null,
+      "mode": "unlicensed",
+      "reason": "wrong_tenant"
+    },
+    {
+      "name": "unknown status",
+      "ent": {
+        "tenant_id": "t1",
+        "status": "weird",
+        "full_until": "2026-11-01T00:00:00Z",
+        "grace_until": "2026-11-08T00:00:00Z"
+      },
+      "now": "2026-10-10T00:00:00Z",
+      "high_water": null,
+      "mode": "unlicensed",
+      "reason": "invalid_status"
+    },
+    {
+      "name": "clock rolled back past high-water mark: still expired",
+      "ent": {
+        "tenant_id": "t1",
+        "status": "active",
+        "full_until": "2026-11-01T00:00:00Z",
+        "grace_until": "2026-11-08T00:00:00Z"
+      },
+      "now": "2026-10-10T00:00:00Z",
+      "high_water": "2026-12-01T00:00:00Z",
+      "mode": "read_only",
+      "reason": "expired"
+    },
+    {
+      "name": "high-water mark inside period changes nothing",
+      "ent": {
+        "tenant_id": "t1",
+        "status": "active",
+        "full_until": "2026-11-01T00:00:00Z",
+        "grace_until": "2026-11-08T00:00:00Z"
+      },
+      "now": "2026-10-10T00:00:00Z",
+      "high_water": "2026-10-12T00:00:00Z",
+      "mode": "full",
+      "reason": "active"
+    }
+  ]
+}

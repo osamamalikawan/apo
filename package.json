@@ -1,0 +1,12 @@
+{
+  "name": "distribution-saas",
+  "private": true,
+  "version": "0.0.1",
+  "workspaces": ["packages/*", "apps/*", "services/*"],
+  "scripts": {
+    "typecheck": "tsc -p packages/domain/tsconfig.json",
+    "test:domain": "node --test packages/domain/test/domain.test.ts",
+    "test:sqlite": "python3 tools/test_sqlite_ledger.py",
+    "test": "npm run typecheck && npm run test:domain && npm run test:sqlite"
+  }
+}

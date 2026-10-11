@@ -1,0 +1,73 @@
+[
+  {
+    "name": "receive_then_sell",
+    "steps": [
+      {"loc": "main", "bucket": "on_hand", "delta": 100, "key": "r1", "expect": "posted"},
+      {"loc": "main", "bucket": "on_hand", "delta": -30, "key": "s1", "expect": "posted"}
+    ],
+    "final": {"main": {"on_hand": 70, "damaged": 0, "in_transit": 0}}
+  },
+  {
+    "name": "overdraw_is_rejected_and_changes_nothing",
+    "steps": [
+      {"loc": "main", "bucket": "on_hand", "delta": 10, "key": "r1", "expect": "posted"},
+      {"loc": "main", "bucket": "on_hand", "delta": -11, "key": "s1", "expect": "rejected"}
+    ],
+    "final": {"main": {"on_hand": 10, "damaged": 0, "in_transit": 0}}
+  },
+  {
+    "name": "retry_with_same_key_is_duplicate",
+    "steps": [
+      {"loc": "main", "bucket": "on_hand", "delta": 50, "key": "r1", "expect": "posted"},
+      {"loc": "main", "bucket": "on_hand", "delta": 50, "key": "r1", "expect": "duplicate"},
+      {"loc": "main", "bucket": "on_hand", "delta": 50, "key": "r1", "expect": "duplicate"}
+    ],
+    "final": {"main": {"on_hand": 50, "damaged": 0, "in_transit": 0}}
+  },
+  {
+    "name": "explicit_negative_policy_allows_overdraw",
+    "steps": [
+      {"loc": "main", "bucket": "on_hand", "delta": 5, "key": "r1", "expect": "posted"},
+      {"loc": "main", "bucket": "on_hand", "delta": -8, "key": "s1", "allow_negative": true, "expect": "posted"}
+    ],
+    "final": {"main": {"on_hand": -3, "damaged": 0, "in_transit": 0}}
+  },
+  {
+    "name": "transfer_moves_stock_exactly_once_even_when_retried",
+    "steps": [
+      {"loc": "g1", "bucket": "on_hand", "delta": 100, "key": "r1", "expect": "posted"},
+      {"loc": "g1", "bucket": "on_hand", "delta": -40, "key": "t1:out", "expect": "posted"},
+      {"loc": "main", "bucket": "on_hand", "delta": 40, "key": "t1:in", "expect": "posted"},
+      {"loc": "g1", "bucket": "on_hand", "delta": -40, "key": "t1:out", "expect": "duplicate"},
+      {"loc": "main", "bucket": "on_hand", "delta": 40, "key": "t1:in", "expect": "duplicate"}
+    ],
+    "final": {
+      "g1": {"on_hand": 60, "damaged": 0, "in_transit": 0},
+      "main": {"on_hand": 40, "damaged": 0, "in_transit": 0}
+    }
+  },
+  {
+    "name": "in_transit_is_tracked_separately_and_not_double_counted",
+    "steps": [
+      {"loc": "g1", "bucket": "on_hand", "delta": 100, "key": "r1", "expect": "posted"},
+      {"loc": "g1", "bucket": "on_hand", "delta": -25, "key": "d1:src", "expect": "posted"},
+      {"loc": "g1", "bucket": "in_transit", "delta": 25, "key": "d1:transit", "expect": "posted"},
+      {"loc": "g1", "bucket": "in_transit", "delta": -25, "key": "d1:recv-transit", "expect": "posted"},
+      {"loc": "main", "bucket": "on_hand", "delta": 25, "key": "d1:dest", "expect": "posted"}
+    ],
+    "final": {
+      "g1": {"on_hand": 75, "damaged": 0, "in_transit": 0},
+      "main": {"on_hand": 25, "damaged": 0, "in_transit": 0}
+    }
+  },
+  {
+    "name": "damaged_bucket_is_separate_and_cannot_go_negative",
+    "steps": [
+      {"loc": "main", "bucket": "on_hand", "delta": 20, "key": "r1", "expect": "posted"},
+      {"loc": "main", "bucket": "on_hand", "delta": -3, "key": "x1:out", "expect": "posted"},
+      {"loc": "main", "bucket": "damaged", "delta": 3, "key": "x1:dmg", "expect": "posted"},
+      {"loc": "main", "bucket": "damaged", "delta": -4, "key": "x2", "expect": "rejected"}
+    ],
+    "final": {"main": {"on_hand": 17, "damaged": 3, "in_transit": 0}}
+  }
+]

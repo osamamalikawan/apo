@@ -1,0 +1,10 @@
+node_modules/
+target/
+apps/desktop/src-tauri/target/
+patches/
+dist/
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
