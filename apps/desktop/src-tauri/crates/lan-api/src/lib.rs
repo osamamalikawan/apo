@@ -13,11 +13,14 @@
 //! writing. Sign-in, sign-out and changing your own password/PIN are NOT business writes and keep
 //! working when a subscription is suspended (otherwise a lapse would lock the owner out of their data).
 
+pub mod authz;
 pub mod entitlement;
 pub mod tls;
 
+mod admin;
+
 use axum::{
-    extract::{Path, Request, State},
+    extract::{Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -60,7 +63,8 @@ pub enum ApiError {
     DeviceLimit,
     InvalidCredentials,
     SessionRequired,
-    Forbidden,
+    /// 403 with a reason code: no_permission, location_denied, route_denied, cannot_grant_more_than_you_hold.
+    Forbidden(&'static str),
     PasswordRequired,
     UserLimit,
     Conflict(&'static str),
@@ -93,7 +97,10 @@ impl IntoResponse for ApiError {
                 "invalid username or password, or the account is temporarily locked",
             ),
             ApiError::SessionRequired => (StatusCode::UNAUTHORIZED, "session_required", "sign in to continue"),
-            ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden", "you do not have permission to do this"),
+            ApiError::Forbidden(r) => {
+                reason = Some(r);
+                (StatusCode::FORBIDDEN, "forbidden", "you do not have permission to do this")
+            }
             ApiError::PasswordRequired => (
                 StatusCode::FORBIDDEN,
                 "password_login_required",
@@ -175,6 +182,7 @@ fn user_err(e: UserError) -> ApiError {
         UserError::InvalidCredentials => ApiError::InvalidCredentials,
         UserError::BadInput(m) => ApiError::BadRequest(m),
         UserError::Conflict(m) => ApiError::Conflict(m),
+        UserError::Forbidden(m) => ApiError::Forbidden(m),
         UserError::NotFound => ApiError::NotFound,
         UserError::Sqlite(_) => ApiError::Internal,
     }
@@ -208,22 +216,6 @@ async fn require_session(State(st): State<AppState>, mut req: Request, next: Nex
         Ok(None) => ApiError::SessionRequired.into_response(),
         Err(e) => e.into_response(),
     }
-}
-
-/// Shared gate for user administration: password sign-in, the `users.manage` permission, and a
-/// subscription that allows writes. Returns the plan's user limit.
-fn guard_user_admin(c: &Connection, tenant: &str, pk: &[u8; 32], p: &Principal) -> Result<Result<i64, ApiError>, DbError> {
-    if p.method != Method::Password {
-        return Ok(Err(ApiError::PasswordRequired));
-    }
-    if !p.can("users.manage") {
-        return Ok(Err(ApiError::Forbidden));
-    }
-    let (dec, ent) = entitlement::decide(c, tenant, pk)?;
-    if !dec.mode.can_write() {
-        return Ok(Err(ApiError::SubscriptionInactive(dec.reason)));
-    }
-    Ok(Ok(ent.map(|e| e.limits.max_users).unwrap_or(0)))
 }
 
 #[derive(Deserialize)]
@@ -286,6 +278,8 @@ async fn me(Extension(p): Extension<Principal>) -> Json<serde_json::Value> {
         "user": { "id": p.user_id, "username": p.username, "full_name": p.full_name },
         "method": p.method.as_str(),
         "permissions": p.permissions,
+        "all_locations": p.access().all_locations,
+        "location_ids": p.location_ids,
     }))
 }
 
@@ -342,59 +336,6 @@ async fn set_pin(
     })
     .await?
     .map_err(user_err)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Deserialize)]
-struct CreateUserReq {
-    username: String,
-    full_name: String,
-    password: String,
-}
-
-async fn create_user(
-    State(st): State<AppState>,
-    Extension(d): Extension<AuthedDevice>,
-    Extension(p): Extension<Principal>,
-    Json(req): Json<CreateUserReq>,
-) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    if req.username.len() > 64 || req.full_name.len() > 256 || req.password.len() > 512 {
-        return Err(ApiError::BadRequest("value is too long"));
-    }
-    let tenant = st.tenant_id.to_string();
-    let pk = st.license_pubkey;
-    let id = db(&st, move |c| {
-        let max = match guard_user_admin(c, &tenant, &pk, &p)? {
-            Ok(m) => m,
-            Err(e) => return Ok(Err(e)),
-        };
-        if users::count_active_users(c, &tenant)? >= max {
-            return Ok(Err(ApiError::UserLimit));
-        }
-        let now = now_utc(c)?;
-        Ok(users::create_user(c, &tenant, Some(&p.user_id), Some(&d.0), &req.username, &req.full_name, &req.password, &now)
-            .map_err(user_err))
-    })
-    .await??;
-    Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
-}
-
-async fn deactivate_user(
-    State(st): State<AppState>,
-    Extension(d): Extension<AuthedDevice>,
-    Extension(p): Extension<Principal>,
-    Path(user_id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    let tenant = st.tenant_id.to_string();
-    let pk = st.license_pubkey;
-    db(&st, move |c| {
-        if let Err(e) = guard_user_admin(c, &tenant, &pk, &p)? {
-            return Ok(Err(e));
-        }
-        let now = now_utc(c)?;
-        Ok(users::deactivate_user(c, &tenant, &p.user_id, Some(&d.0), &user_id, &now).map_err(user_err))
-    })
-    .await??;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -502,8 +443,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/me", get(me))
         .route("/v1/me/password", post(change_password))
         .route("/v1/me/pin", post(set_pin))
-        .route("/v1/users", post(create_user))
-        .route("/v1/users/:id/deactivate", post(deactivate_user))
+        .merge(admin::routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_session));
     let authed = Router::new()
         .route("/v1/whoami", get(whoami))
@@ -1077,5 +1017,220 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         let (s, _) = call(&app, req("POST", "/v1/auth/logout", &authed(&id, &secret, &b), None)).await;
         assert_eq!(s, StatusCode::NO_CONTENT);
+    }
+
+    // ---------- roles, permissions and scope ----------
+
+    async fn put_json(app: &Router, uri: &str, h: &[(&str, &str)], body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        call(app, req("PUT", uri, h, Some(&body.to_string()))).await
+    }
+
+    /// Create a user holding one custom role with `perms` (done by the owner), and sign them in.
+    /// Returns (user id, role id, bearer header value).
+    async fn user_with_role(app: &Router, id: &str, secret: &str, owner_bearer: &str, name: &str, perms: &[&str]) -> (String, String, String) {
+        let h = authed(id, secret, owner_bearer);
+        let (s, u) = post_json(app, "/v1/users", &h, serde_json::json!({ "username": name, "full_name": name, "password": "clerk password 1" })).await;
+        assert_eq!(s, StatusCode::CREATED, "{u}");
+        let (s, r) = post_json(app, "/v1/roles", &h, serde_json::json!({ "name": format!("{name} role"), "permissions": perms })).await;
+        assert_eq!(s, StatusCode::CREATED, "{r}");
+        let (uid, rid) = (u["id"].as_str().unwrap().to_string(), r["id"].as_str().unwrap().to_string());
+        let (s, e) = put_json(app, &format!("/v1/users/{uid}/roles"), &h, serde_json::json!({ "role_ids": [rid] })).await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "{e}");
+        let (s, l) = sign_in(app, id, secret, name, "clerk password 1").await;
+        assert_eq!(s, StatusCode::OK);
+        (uid, rid, bearer(l["token"].as_str().unwrap()))
+    }
+
+    fn add_locations(writer: &Arc<Writer>) {
+        writer
+            .run(|c| {
+                c.execute_batch(
+                    "INSERT INTO stock_locations(id,tenant_id,name,code) VALUES
+                       ('main','t1','Main','MAIN'),('g1','t1','Godown 1','G1'),('g2','t1','Godown 2','G2');",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn role_admin_needs_the_roles_manage_permission() {
+        let (app, writer, _) = make();
+        let (id, secret, token) = owner_session(&app, &writer).await;
+        let ob = bearer(&token);
+        let (_, _, clerk) = user_with_role(&app, &id, &secret, &ob, "clerk1", &["sales.view"]).await;
+        for (m, uri) in [("GET", "/v1/roles"), ("GET", "/v1/permissions"), ("GET", "/v1/users")] {
+            let (s, e) = call(&app, req(m, uri, &authed(&id, &secret, &clerk), None)).await;
+            assert_eq!((s, e["error"].as_str(), e["reason"].as_str()), (StatusCode::FORBIDDEN, Some("forbidden"), Some("no_permission")), "{uri}");
+        }
+        let (s, p) = call(&app, req("GET", "/v1/permissions", &authed(&id, &secret, &ob), None)).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(p.as_array().unwrap().iter().any(|x| x["permission"] == "inventory.transfer" && x["description"].is_string()));
+    }
+
+    #[tokio::test]
+    async fn a_role_can_be_created_listed_edited_and_deleted() {
+        let (app, writer, _) = make();
+        let (id, secret, token) = owner_session(&app, &writer).await;
+        let h_owner = bearer(&token);
+        let h = authed(&id, &secret, &h_owner);
+        let (s, r) = post_json(&app, "/v1/roles", &h, serde_json::json!({ "name": "Cashier", "permissions": ["sales.create", "inventory.view", "sales.create"] })).await;
+        assert_eq!(s, StatusCode::CREATED, "{r}");
+        let rid = r["id"].as_str().unwrap().to_string();
+
+        let (_, list) = call(&app, req("GET", "/v1/roles", &h, None)).await;
+        let cashier = list.as_array().unwrap().iter().find(|x| x["id"] == rid.as_str()).unwrap().clone();
+        assert_eq!(cashier["permissions"], serde_json::json!(["inventory.view", "sales.create"]));
+        assert_eq!((cashier["member_count"].as_i64(), cashier["protected"].as_bool()), (Some(0), Some(false)));
+        assert!(list.as_array().unwrap().iter().any(|x| x["protected"] == true && x["name"] == "Owner"));
+
+        // validation and conflicts
+        let bad = |n: &str, p: serde_json::Value| serde_json::json!({ "name": n, "permissions": p });
+        assert_eq!(post_json(&app, "/v1/roles", &h, bad("Typo", serde_json::json!(["inventory.transfr"]))).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(post_json(&app, "/v1/roles", &h, bad("cashier", serde_json::json!([]))).await.0, StatusCode::CONFLICT);
+        assert_eq!(post_json(&app, "/v1/roles", &h, bad("Owner", serde_json::json!([]))).await.0, StatusCode::BAD_REQUEST);
+
+        let (s, _) = put_json(&app, &format!("/v1/roles/{rid}"), &h, bad("Senior cashier", serde_json::json!(["sales.*", "inventory.view"]))).await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        let (s, _) = call(&app, req("DELETE", &format!("/v1/roles/{rid}"), &h, None)).await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        let (s, _) = call(&app, req("DELETE", &format!("/v1/roles/{rid}"), &h, None)).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_role_manager_cannot_grant_more_than_they_hold() {
+        let (app, writer, _) = make();
+        let (id, secret, token) = owner_session(&app, &writer).await;
+        let ob = bearer(&token);
+        let (_, _, mgr) = user_with_role(&app, &id, &secret, &ob, "mgr", &["roles.manage", "inventory.*"]).await;
+        let h = authed(&id, &secret, &mgr);
+        let mk = |n: &str, p: serde_json::Value| serde_json::json!({ "name": n, "permissions": p });
+        assert_eq!(post_json(&app, "/v1/roles", &h, mk("Stock", serde_json::json!(["inventory.view"]))).await.0, StatusCode::CREATED);
+        for p in [serde_json::json!(["*"]), serde_json::json!(["sales.create"]), serde_json::json!(["users.*"])] {
+            let (s, e) = post_json(&app, "/v1/roles", &h, mk("Sneaky", p)).await;
+            assert_eq!((s, e["reason"].as_str()), (StatusCode::FORBIDDEN, Some("cannot_grant_more_than_you_hold")));
+        }
+        // handing themselves the Owner role is refused too
+        let (_, list) = call(&app, req("GET", "/v1/roles", &h, None)).await;
+        let owner_role = list.as_array().unwrap().iter().find(|x| x["protected"] == true).unwrap()["id"].as_str().unwrap().to_string();
+        let (_, users) = call(&app, req("GET", "/v1/users", &authed(&id, &secret, &ob), None)).await;
+        let mgr_id = users.as_array().unwrap().iter().find(|u| u["username"] == "mgr").unwrap()["id"].as_str().unwrap().to_string();
+        let (s, e) = put_json(&app, &format!("/v1/users/{mgr_id}/roles"), &h, serde_json::json!({ "role_ids": [owner_role] })).await;
+        assert_eq!((s, e["reason"].as_str()), (StatusCode::FORBIDDEN, Some("cannot_grant_more_than_you_hold")));
+    }
+
+    #[tokio::test]
+    async fn assigned_roles_take_effect_on_the_same_session_immediately() {
+        let (app, writer, _) = make();
+        let (id, secret, token) = owner_session(&app, &writer).await;
+        let ob = bearer(&token);
+        let (uid, rid, clerk) = user_with_role(&app, &id, &secret, &ob, "clerk1", &["sales.view"]).await;
+        let me = |b: String| {
+            let app = app.clone();
+            let (id, secret) = (id.clone(), secret.clone());
+            async move { call(&app, req("GET", "/v1/me", &authed(&id, &secret, &b), None)).await.1 }
+        };
+        assert_eq!(me(clerk.clone()).await["permissions"], serde_json::json!(["sales.view"]));
+        let h = authed(&id, &secret, &ob);
+        put_json(&app, &format!("/v1/roles/{rid}"), &h, serde_json::json!({ "name": "clerk1 role", "permissions": ["sales.view", "sales.create"] })).await;
+        assert_eq!(me(clerk.clone()).await["permissions"], serde_json::json!(["sales.create", "sales.view"]));
+        let (s, _) = put_json(&app, &format!("/v1/users/{uid}/roles"), &h, serde_json::json!({ "role_ids": [] })).await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        assert_eq!(me(clerk).await["permissions"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn the_owner_role_and_the_last_owner_are_protected() {
+        let (app, writer, _) = make();
+        let (id, secret, token) = owner_session(&app, &writer).await;
+        let h_owner = bearer(&token);
+        let h = authed(&id, &secret, &h_owner);
+        let (_, list) = call(&app, req("GET", "/v1/roles", &h, None)).await;
+        let owner_role = list.as_array().unwrap().iter().find(|x| x["protected"] == true).unwrap()["id"].as_str().unwrap().to_string();
+        let (s, _) = put_json(&app, &format!("/v1/roles/{owner_role}"), &h, serde_json::json!({ "name": "Owner", "permissions": ["sales.view"] })).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        let (s, _) = call(&app, req("DELETE", &format!("/v1/roles/{owner_role}"), &h, None)).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        let boss_id = writer.run(|c| Ok(c.query_row("SELECT id FROM users WHERE username='boss'", [], |r| r.get::<_, String>(0))?)).unwrap();
+        let (s, e) = put_json(&app, &format!("/v1/users/{boss_id}/roles"), &h, serde_json::json!({ "role_ids": [] })).await;
+        assert_eq!((s, e["error"].as_str()), (StatusCode::CONFLICT, Some("conflict")));
+        let (_, m) = call(&app, req("GET", "/v1/me", &h, None)).await;
+        assert_eq!(m["permissions"], serde_json::json!(["*"]), "refused change left the owner intact");
+    }
+
+    #[tokio::test]
+    async fn location_access_can_be_set_and_is_visible_on_me() {
+        let (app, writer, _) = make();
+        add_locations(&writer);
+        let (id, secret, token) = owner_session(&app, &writer).await;
+        let ob = bearer(&token);
+        let (uid, _, clerk) = user_with_role(&app, &id, &secret, &ob, "clerk1", &["sales.view"]).await;
+        let h = authed(&id, &secret, &ob);
+        let (s, _) = put_json(&app, &format!("/v1/users/{uid}/locations"), &h, serde_json::json!({ "location_ids": ["nowhere"] })).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = put_json(&app, &format!("/v1/users/{uid}/locations"), &h, serde_json::json!({ "location_ids": ["main", "g1"] })).await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        let (_, m) = call(&app, req("GET", "/v1/me", &authed(&id, &secret, &clerk), None)).await;
+        assert_eq!((m["all_locations"].as_bool(), m["location_ids"].clone()), (Some(false), serde_json::json!(["g1", "main"])));
+        let (_, om) = call(&app, req("GET", "/v1/me", &h, None)).await;
+        assert_eq!(om["all_locations"], true, "the owner's * covers every location");
+        let (s, _) = put_json(&app, "/v1/users/ghost/locations", &h, serde_json::json!({ "location_ids": [] })).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_limited_supervisor_can_only_manage_locations_they_have() {
+        let (app, writer, _) = make();
+        add_locations(&writer);
+        let (id, secret, token) = owner_session(&app, &writer).await;
+        let ob = bearer(&token);
+        let (sup_id, _, sup) = user_with_role(&app, &id, &secret, &ob, "sup", &["users.manage"]).await;
+        let (w_id, _, _) = user_with_role(&app, &id, &secret, &ob, "worker", &["sales.view"]).await;
+        let owner_h = authed(&id, &secret, &ob);
+        put_json(&app, &format!("/v1/users/{sup_id}/locations"), &owner_h, serde_json::json!({ "location_ids": ["g1"] })).await;
+        // the supervisor's session already exists: permissions and locations are re-read per request
+        let sh = authed(&id, &secret, &sup);
+        let (s, _) = put_json(&app, &format!("/v1/users/{w_id}/locations"), &sh, serde_json::json!({ "location_ids": ["g1"] })).await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        let (s, e) = put_json(&app, &format!("/v1/users/{w_id}/locations"), &sh, serde_json::json!({ "location_ids": ["g1", "g2"] })).await;
+        assert_eq!((s, e["reason"].as_str()), (StatusCode::FORBIDDEN, Some("cannot_grant_more_than_you_hold")));
+    }
+
+    #[tokio::test]
+    async fn user_listing_shows_roles_and_locations_and_never_secrets() {
+        let (app, writer, _) = make();
+        let (id, secret, token) = owner_session(&app, &writer).await;
+        let ob = bearer(&token);
+        let (uid, rid, _) = user_with_role(&app, &id, &secret, &ob, "clerk1", &["sales.view"]).await;
+        let (s, v) = call(&app, req("GET", "/v1/users", &authed(&id, &secret, &ob), None)).await;
+        assert_eq!(s, StatusCode::OK);
+        let raw = v.to_string();
+        assert!(!raw.contains("argon2") && !raw.contains("hash") && !raw.contains("password"));
+        let clerk = v.as_array().unwrap().iter().find(|u| u["id"] == uid.as_str()).unwrap();
+        assert_eq!((clerk["username"].as_str(), clerk["is_active"].as_bool(), clerk["role_ids"].clone()), (Some("clerk1"), Some(true), serde_json::json!([rid])));
+    }
+
+    #[tokio::test]
+    async fn pin_sessions_and_suspension_are_handled_by_the_shared_gate() {
+        let (app, writer, _) = make();
+        let (id, secret, token) = owner_session(&app, &writer).await;
+        let ob = bearer(&token);
+        let h = authed(&id, &secret, &ob);
+        post_json(&app, "/v1/me/pin", &h, serde_json::json!({ "current_password": PW, "pin": "2580" })).await;
+        let (_, l) = post_json(&app, "/v1/auth/login", &creds(&id, &secret), serde_json::json!({ "username": "boss", "pin": "2580" })).await;
+        let pb = bearer(l["token"].as_str().unwrap());
+        let ph = authed(&id, &secret, &pb);
+        // a PIN session can read role data but not change it
+        assert_eq!(call(&app, req("GET", "/v1/roles", &ph, None)).await.0, StatusCode::OK);
+        let (s, e) = post_json(&app, "/v1/roles", &ph, serde_json::json!({ "name": "X role", "permissions": [] })).await;
+        assert_eq!((s, e["error"].as_str()), (StatusCode::FORBIDDEN, Some("password_login_required")));
+
+        // suspended shop: reads continue, writes stop with 402
+        apply_env(&writer, "suspended_rev2").unwrap();
+        assert_eq!(call(&app, req("GET", "/v1/roles", &h, None)).await.0, StatusCode::OK);
+        assert_eq!(call(&app, req("GET", "/v1/users", &h, None)).await.0, StatusCode::OK);
+        let (s, e) = post_json(&app, "/v1/roles", &h, serde_json::json!({ "name": "Late role", "permissions": [] })).await;
+        assert_eq!((s, e["error"].as_str(), e["reason"].as_str()), (StatusCode::PAYMENT_REQUIRED, Some("subscription_inactive"), Some("suspended")));
     }
 }

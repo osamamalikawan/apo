@@ -10,8 +10,8 @@ panel that can revoke subscriptions remotely. Read `docs/adr/` for the why; `STA
 |---|---|---|---|
 | Domain rules (TS) | `packages/domain` | money, permissions, reference stock ledger, entitlement rules | its README |
 | Shared test vectors | `packages/test-vectors` | JSON cases every language must pass | its README |
-| Shop DB (Rust + SQLite) | `apps/desktop/src-tauri/crates/db` | migrations, single writer, device pairing, users/login/sessions | its README |
-| Shop API (Rust) | `apps/desktop/src-tauri/crates/lan-api` | HTTPS API, device auth, user sessions, TLS, subscription enforcement | its README |
+| Shop DB (Rust + SQLite) | `apps/desktop/src-tauri/crates/db` | migrations, single writer, device pairing, users/login/sessions, roles/permissions/scope | its README |
+| Shop API (Rust) | `apps/desktop/src-tauri/crates/lan-api` | HTTPS API, device auth, user sessions, shared authorization (`authz`), user/role admin, TLS, subscription enforcement | its README |
 | Cloud (Postgres) | `supabase/` | schema, RLS, RPCs, Super Admin functions, SQL tests | its README |
 | Dev tools | `tools/` | SQLite test runner, dev license signer, vector generator | its README |
 | Cloudflare Worker | `services/worker` | **not started** (signs entitlements, sync gateway) | ADR 0003, 0006 |
@@ -27,9 +27,12 @@ panel that can revoke subscriptions remotely. Read `docs/adr/` for the why; `STA
 3. **Authorization at every boundary** (LAN API, Worker, Postgres RLS/RPC). Hiding a button is not security.
 4. **Stock = append-only ledger** (`stock_movements`) with idempotency keys; balances are derived. Never overwrite a quantity.
 5. **Money = integer minor units** (bigint / i64) + currency. No floats. Quantities are integers.
-6. **Subscription:** every business *write* endpoint must call `entitlement::decide` and refuse unless `mode.can_write()`.
+6. **Subscription and permissions:** every endpoint that acts as a user goes through `authz::check` (lan-api) with a `Requirement`
+   (`read`/`write`, `.sensitive()` for password-only actions), which checks permission, location/route scope and, for writes,
+   `entitlement::decide` in one place. Do not call `Principal::can` ad hoc. New permission strings go in `dsaas_db::roles::PERMISSIONS`.
    Reads stay available when suspended. Nothing is deleted on lapse (ADR 0006).
-7. **Migrations are append-only.** Never edit an applied migration; add the next number. SQLite and Postgres are
+7. **Two separate migration folders, same numbering style.** `supabase/migrations` is Postgres (pasted into Supabase); `apps/desktop/src-tauri/crates/db/migrations` is SQLite (applied by the server). Never mix them.
+   **Migrations are append-only.** Never edit an applied migration; add the next number. SQLite and Postgres are
    separate files kept in logical parity.
 8. **Shared vectors:** if you change a rule that has vectors (`packages/test-vectors`), update every consumer
    (TS tests, `tools/test_sqlite_ledger.py`, Rust tests, SQL tests) in the same patch.
@@ -51,8 +54,8 @@ reach it). 3. Rules in `packages/domain` + vectors. 4. Service functions in `cra
 6. Sync: write the outbox row in the same transaction as the change. 7. Tests at every layer; update `STATUS.md`.
 
 ## Suggested build order (dependencies first)
-1. ~~Users and login on the LAN server (Argon2id, sessions, PIN)~~ **done, see ADR 0007** 2. Roles/permissions tables + a shared authorization
-middleware (permission + location/route scope + entitlement) 3. Master data: locations, products, customers
+1. ~~Users and login on the LAN server (Argon2id, sessions, PIN)~~ **done, see ADR 0007** 2. ~~Roles/permissions tables + a shared authorization
+middleware (permission + location/route scope + entitlement)~~ **done, see ADR 0008** 3. Master data: locations, products, customers
 4. Inventory service: transfers, counts, reservations (spec in the original multi-location brief)
 5. Sales, payments, accounts ledger 6. Sync engine (outbox/inbox, hourly + manual, conflicts)
 7. Cloudflare Worker (auth, sync, entitlement signing) 8. Tauri shell + React UI (header: version, sync status)

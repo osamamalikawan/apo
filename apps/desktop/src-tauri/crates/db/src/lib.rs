@@ -4,6 +4,7 @@
 //! migrations run inside a transaction after a backup.
 
 pub mod pairing;
+pub mod roles;
 pub mod users;
 pub use rusqlite;
 

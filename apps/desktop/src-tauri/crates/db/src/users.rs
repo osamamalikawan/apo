@@ -37,6 +37,9 @@ pub enum UserError {
     BadInput(&'static str),
     #[error("{0}")]
     Conflict(&'static str),
+    /// The caller may not do this (for example grant permissions they do not hold themselves).
+    #[error("{0}")]
+    Forbidden(&'static str),
     #[error("not found")]
     NotFound,
     #[error("sqlite: {0}")]
@@ -155,10 +158,26 @@ fn audit(
     after: Option<&str>,
     now: &str,
 ) -> Result<(), rusqlite::Error> {
+    audit_entity(conn, tenant, actor, device, action, "user", entity_id, None, after, now)
+}
+
+/// Audit row for any entity, with optional before/after JSON. Never put secrets in `before`/`after`.
+pub(crate) fn audit_entity(
+    conn: &Connection,
+    tenant: &str,
+    actor: Option<&str>,
+    device: Option<&str>,
+    action: &str,
+    entity: &str,
+    entity_id: Option<&str>,
+    before: Option<&str>,
+    after: Option<&str>,
+    now: &str,
+) -> Result<(), rusqlite::Error> {
     conn.execute(
-        "INSERT INTO audit_logs(id,tenant_id,actor_id,device_id,action,entity,entity_id,after_json,at)
-         VALUES (?1,?2,?3,?4,?5,'user',?6,?7,?8)",
-        params![uuid::Uuid::new_v4().to_string(), tenant, actor, device, action, entity_id, after, now],
+        "INSERT INTO audit_logs(id,tenant_id,actor_id,device_id,action,entity,entity_id,before_json,after_json,at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![uuid::Uuid::new_v4().to_string(), tenant, actor, device, action, entity, entity_id, before, after, now],
     )?;
     Ok(())
 }
@@ -171,6 +190,61 @@ pub fn has_permission(granted: &[String], needed: &str) -> bool {
     let module = needed.split('.').next().unwrap_or("");
     let module_all = format!("{module}.*");
     granted.iter().any(|g| g == "*" || g == needed || *g == module_all)
+}
+
+/// Everything needed to answer "may this user do X here?". Mirrors `AccessContext` in
+/// packages/domain/src/permissions.ts; the shared vectors test both implementations.
+#[derive(Debug, Clone, Default)]
+pub struct AccessContext {
+    pub permissions: Vec<String>,
+    pub all_locations: bool,
+    pub location_ids: Vec<String>,
+    pub all_routes: bool,
+    pub route_ids: Vec<String>,
+}
+
+/// Where an action happens. `None` means the action is not tied to that kind of scope.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Scope<'a> {
+    pub location_id: Option<&'a str>,
+    pub route_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Denied {
+    NoPermission,
+    LocationDenied,
+    RouteDenied,
+}
+
+impl Denied {
+    pub fn code(self) -> &'static str {
+        match self {
+            Denied::NoPermission => "no_permission",
+            Denied::LocationDenied => "location_denied",
+            Denied::RouteDenied => "route_denied",
+        }
+    }
+}
+
+impl AccessContext {
+    /// Permission first, then location, then route. Mirrors `authorize` in permissions.ts.
+    pub fn authorize(&self, needed: &str, scope: Scope) -> Result<(), Denied> {
+        if !has_permission(&self.permissions, needed) {
+            return Err(Denied::NoPermission);
+        }
+        if let Some(l) = scope.location_id {
+            if !self.all_locations && !self.location_ids.iter().any(|x| x == l) {
+                return Err(Denied::LocationDenied);
+            }
+        }
+        if let Some(r) = scope.route_id {
+            if !self.all_routes && !self.route_ids.iter().any(|x| x == r) {
+                return Err(Denied::RouteDenied);
+            }
+        }
+        Ok(())
+    }
 }
 
 pub fn permissions_for_user(conn: &Connection, tenant: &str, user_id: &str) -> Result<Vec<String>, DbError> {
@@ -382,11 +456,29 @@ pub struct Principal {
     pub full_name: String,
     pub method: Method,
     pub permissions: Vec<String>,
+    /// Locations granted one by one (`user_location_access`); irrelevant when `locations.all` is held.
+    pub location_ids: Vec<String>,
 }
 
 impl Principal {
     pub fn can(&self, needed: &str) -> bool {
         has_permission(&self.permissions, needed)
+    }
+
+    /// "locations.all" (or "*") means every location. Route scope has no tables yet (build step 10),
+    /// so only "routes.all" (or "*") passes a route check: unknown scope is denied, never allowed.
+    pub fn access(&self) -> AccessContext {
+        AccessContext {
+            permissions: self.permissions.clone(),
+            all_locations: has_permission(&self.permissions, "locations.all"),
+            location_ids: self.location_ids.clone(),
+            all_routes: has_permission(&self.permissions, "routes.all"),
+            route_ids: Vec::new(),
+        }
+    }
+
+    pub fn authorize(&self, needed: &str, scope: Scope) -> Result<(), Denied> {
+        self.access().authorize(needed, scope)
     }
 }
 
@@ -416,8 +508,15 @@ pub fn authenticate_session(
     };
     conn.execute("UPDATE user_sessions SET last_used_at=?2 WHERE id=?1", params![session_id, now])?;
     let permissions = permissions_for_user(conn, tenant, &user_id)?;
+    let location_ids = {
+        let mut st = conn.prepare(
+            "SELECT location_id FROM user_location_access WHERE tenant_id=?1 AND user_id=?2 ORDER BY location_id",
+        )?;
+        let rows = st.query_map(params![tenant, user_id], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
     let method = if method == "pin" { Method::Pin } else { Method::Password };
-    Ok(Some(Principal { session_id, user_id, username, full_name, method, permissions }))
+    Ok(Some(Principal { session_id, user_id, username, full_name, method, permissions, location_ids }))
 }
 
 pub fn logout(conn: &Connection, tenant: &str, session_id: &str, now: &str) -> Result<(), DbError> {
@@ -833,6 +932,62 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 5);
+    }
+
+    #[test]
+    fn authorize_follows_the_shared_vectors_including_scope() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../../../packages/test-vectors/permissions.json")).unwrap();
+        let strings = |a: &serde_json::Value| -> Vec<String> {
+            a.as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect()
+        };
+        for case in v["cases"].as_array().unwrap() {
+            let c = &v["contexts"][case["ctx"].as_str().unwrap()];
+            let ctx = AccessContext {
+                permissions: strings(&c["permissions"]),
+                all_locations: c["allLocations"].as_bool().unwrap(),
+                location_ids: strings(&c["locationIds"]),
+                all_routes: c["allRoutes"].as_bool().unwrap(),
+                route_ids: strings(&c["routeIds"]),
+            };
+            let scope = Scope {
+                location_id: case["scope"]["locationId"].as_str(),
+                route_id: case["scope"]["routeId"].as_str(),
+            };
+            let got = ctx.authorize(case["perm"].as_str().unwrap(), scope);
+            match case["allowed"].as_bool().unwrap() {
+                true => assert_eq!(got, Ok(()), "{case}"),
+                false => assert_eq!(got.unwrap_err().code(), case["reason"].as_str().unwrap(), "{case}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_principal_derives_its_scope_from_permissions_and_assigned_locations() {
+        let mk = |perms: &[&str], locs: &[&str]| Principal {
+            session_id: "s".into(),
+            user_id: "u".into(),
+            username: "u".into(),
+            full_name: "U".into(),
+            method: Method::Password,
+            permissions: perms.iter().map(|s| s.to_string()).collect(),
+            location_ids: locs.iter().map(|s| s.to_string()).collect(),
+        };
+        let cashier = mk(&["sales.create"], &["main"]);
+        assert_eq!(cashier.authorize("sales.create", Scope { location_id: Some("main"), route_id: None }), Ok(()));
+        assert_eq!(
+            cashier.authorize("sales.create", Scope { location_id: Some("g1"), route_id: None }),
+            Err(Denied::LocationDenied)
+        );
+        assert_eq!(
+            cashier.authorize("sales.create", Scope { location_id: None, route_id: Some("r1") }),
+            Err(Denied::RouteDenied),
+            "route scope is denied until routes exist"
+        );
+        let all = mk(&["sales.create", "locations.all"], &[]);
+        assert_eq!(all.authorize("sales.create", Scope { location_id: Some("anything"), route_id: None }), Ok(()));
+        let owner = mk(&["*"], &[]);
+        assert_eq!(owner.authorize("x.y", Scope { location_id: Some("l"), route_id: Some("r") }), Ok(()));
     }
 
     #[test]
