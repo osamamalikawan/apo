@@ -40,6 +40,9 @@ pub enum UserError {
     /// The caller may not do this (for example grant permissions they do not hold themselves).
     #[error("{0}")]
     Forbidden(&'static str),
+    /// The record changed since the caller read it (optimistic concurrency): reload and retry.
+    #[error("stale revision")]
+    Stale,
     #[error("not found")]
     NotFound,
     #[error("sqlite: {0}")]
@@ -233,6 +236,11 @@ impl AccessContext {
         if !has_permission(&self.permissions, needed) {
             return Err(Denied::NoPermission);
         }
+        self.check_scope(scope)
+    }
+
+    /// Location and route scope only, for actions that need no specific permission (any signed-in user).
+    pub fn check_scope(&self, scope: Scope) -> Result<(), Denied> {
         if let Some(l) = scope.location_id {
             if !self.all_locations && !self.location_ids.iter().any(|x| x == l) {
                 return Err(Denied::LocationDenied);
@@ -479,6 +487,10 @@ impl Principal {
 
     pub fn authorize(&self, needed: &str, scope: Scope) -> Result<(), Denied> {
         self.access().authorize(needed, scope)
+    }
+
+    pub fn check_scope(&self, scope: Scope) -> Result<(), Denied> {
+        self.access().check_scope(scope)
     }
 }
 

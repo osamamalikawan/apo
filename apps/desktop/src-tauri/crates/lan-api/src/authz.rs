@@ -17,7 +17,8 @@ use dsaas_db::{
 
 #[derive(Debug, Clone, Copy)]
 pub struct Requirement {
-    pub permission: &'static str,
+    /// `None` means "any signed-in user" (only scope is checked, e.g. listing the locations you can use).
+    pub permission: Option<&'static str>,
     /// A business write: refused unless the subscription allows writing.
     pub write: bool,
     /// Needs a password sign-in (not a PIN session).
@@ -26,10 +27,14 @@ pub struct Requirement {
 
 impl Requirement {
     pub const fn read(permission: &'static str) -> Self {
-        Self { permission, write: false, password_session: false }
+        Self { permission: Some(permission), write: false, password_session: false }
+    }
+    /// Any signed-in user, read-only; location/route scope still applies.
+    pub const fn signed_in() -> Self {
+        Self { permission: None, write: false, password_session: false }
     }
     pub const fn write(permission: &'static str) -> Self {
-        Self { permission, write: true, password_session: false }
+        Self { permission: Some(permission), write: true, password_session: false }
     }
     /// Also require a password sign-in.
     pub const fn sensitive(self) -> Self {
@@ -54,7 +59,11 @@ pub fn check(
     if req.password_session && p.method != Method::Password {
         return Err(ApiError::PasswordRequired);
     }
-    if let Err(d) = p.authorize(req.permission, scope) {
+    let allowed = match req.permission {
+        Some(perm) => p.authorize(perm, scope),
+        None => p.check_scope(scope),
+    };
+    if let Err(d) = allowed {
         return Err(ApiError::Forbidden(d.code()));
     }
     if !req.write {
@@ -102,6 +111,17 @@ mod tests {
             check(&c, "t1", &PK, &who(Method::Password, &["sales.view"], &[]), &r, Scope::default()),
             Err(ApiError::Forbidden("no_permission"))
         ));
+    }
+
+    #[test]
+    fn signed_in_requirements_check_scope_only() {
+        let c = bare();
+        let r = Requirement::signed_in();
+        let nobody = who(Method::Pin, &[], &["main"]);
+        let at = |l: &'static str| Scope { location_id: Some(l), route_id: None };
+        assert!(check(&c, "t1", &PK, &nobody, &r, Scope::default()).is_ok(), "no permission needed");
+        assert!(check(&c, "t1", &PK, &nobody, &r, at("main")).is_ok());
+        assert!(matches!(check(&c, "t1", &PK, &nobody, &r, at("g1")), Err(ApiError::Forbidden("location_denied"))));
     }
 
     #[test]

@@ -34,6 +34,8 @@ panel that can revoke subscriptions remotely. Read `docs/adr/` for the why; `STA
 7. **Two separate migration folders, same numbering style.** `supabase/migrations` is Postgres (pasted into Supabase); `apps/desktop/src-tauri/crates/db/migrations` is SQLite (applied by the server). Never mix them.
    **Migrations are append-only.** Never edit an applied migration; add the next number. SQLite and Postgres are
    separate files kept in logical parity.
+8a. **Master-data records** follow ADR 0009: a `revision` with `expected_revision` on every update (409 `stale_revision`), deactivate instead of delete,
+   and an audit row plus a `sync_outbox` row written in the same transaction as the change.
 8. **Shared vectors:** if you change a rule that has vectors (`packages/test-vectors`), update every consumer
    (TS tests, `tools/test_sqlite_ledger.py`, Rust tests, SQL tests) in the same patch.
 9. **Secrets:** never commit real secrets. The key in `tools/dev-license-key.mjs` is DEV ONLY; production signing
@@ -55,7 +57,7 @@ reach it). 3. Rules in `packages/domain` + vectors. 4. Service functions in `cra
 
 ## Suggested build order (dependencies first)
 1. ~~Users and login on the LAN server (Argon2id, sessions, PIN)~~ **done, see ADR 0007** 2. ~~Roles/permissions tables + a shared authorization
-middleware (permission + location/route scope + entitlement)~~ **done, see ADR 0008** 3. Master data: locations, products, customers
+middleware (permission + location/route scope + entitlement)~~ **done, see ADR 0008** ~~3. Master data: locations, products, customers~~ **done, see ADR 0009**
 4. Inventory service: transfers, counts, reservations (spec in the original multi-location brief)
 5. Sales, payments, accounts ledger 6. Sync engine (outbox/inbox, hourly + manual, conflicts)
 7. Cloudflare Worker (auth, sync, entitlement signing) 8. Tauri shell + React UI (header: version, sync status)

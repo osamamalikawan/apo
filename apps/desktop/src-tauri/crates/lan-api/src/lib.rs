@@ -18,6 +18,7 @@ pub mod entitlement;
 pub mod tls;
 
 mod admin;
+mod master_api;
 
 use axum::{
     extract::{Request, State},
@@ -67,6 +68,9 @@ pub enum ApiError {
     Forbidden(&'static str),
     PasswordRequired,
     UserLimit,
+    LocationLimit,
+    /// The record changed since the caller read it: reload and retry.
+    Stale,
     Conflict(&'static str),
     NotFound,
 }
@@ -107,6 +111,12 @@ impl IntoResponse for ApiError {
                 "sign in with your password (not a PIN) to do this",
             ),
             ApiError::UserLimit => (StatusCode::FORBIDDEN, "user_limit_reached", "the user limit of your plan has been reached"),
+            ApiError::LocationLimit => (StatusCode::FORBIDDEN, "location_limit_reached", "the location limit of your plan has been reached"),
+            ApiError::Stale => (
+                StatusCode::CONFLICT,
+                "stale_revision",
+                "this record was changed by someone else; reload it and try again",
+            ),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, "conflict", m),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not_found", "not found"),
         };
@@ -183,6 +193,7 @@ fn user_err(e: UserError) -> ApiError {
         UserError::BadInput(m) => ApiError::BadRequest(m),
         UserError::Conflict(m) => ApiError::Conflict(m),
         UserError::Forbidden(m) => ApiError::Forbidden(m),
+        UserError::Stale => ApiError::Stale,
         UserError::NotFound => ApiError::NotFound,
         UserError::Sqlite(_) => ApiError::Internal,
     }
@@ -444,6 +455,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/me/password", post(change_password))
         .route("/v1/me/pin", post(set_pin))
         .merge(admin::routes())
+        .merge(master_api::routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_session));
     let authed = Router::new()
         .route("/v1/whoami", get(whoami))
@@ -1232,5 +1244,244 @@ mod tests {
         assert_eq!(call(&app, req("GET", "/v1/users", &h, None)).await.0, StatusCode::OK);
         let (s, e) = post_json(&app, "/v1/roles", &h, serde_json::json!({ "name": "Late role", "permissions": [] })).await;
         assert_eq!((s, e["error"].as_str(), e["reason"].as_str()), (StatusCode::PAYMENT_REQUIRED, Some("subscription_inactive"), Some("suspended")));
+    }
+
+    // ---------- master data: locations, products, customers ----------
+
+    async fn get_json(app: &Router, uri: &str, h: &[(&str, &str)]) -> (StatusCode, serde_json::Value) {
+        call(app, req("GET", uri, h, None)).await
+    }
+
+    /// A signed-in owner on a paired device: (device id, device secret, bearer header value).
+    async fn owner(app: &Router, writer: &Arc<Writer>) -> (String, String, String) {
+        let (id, secret, token) = owner_session(app, writer).await;
+        (id, secret, bearer(&token))
+    }
+
+    #[tokio::test]
+    async fn locations_are_created_edited_with_revisions_and_limited_by_the_plan() {
+        let (app, writer, _) = make();
+        let (id, secret, ob) = owner(&app, &writer).await;
+        let h = authed(&id, &secret, &ob);
+        let loc = |n: &str, c: &str| serde_json::json!({ "name": n, "code": c, "location_type": "shop" });
+        let (s, main) = post_json(&app, "/v1/locations", &h, loc("Main shop", "main")).await;
+        assert_eq!(s, StatusCode::CREATED, "{main}");
+        assert_eq!((main["code"].as_str(), main["revision"].as_i64(), main["is_active"].as_bool()), (Some("MAIN"), Some(1), Some(true)));
+        assert_eq!(post_json(&app, "/v1/locations", &h, loc("Dup", "MAIN")).await.0, StatusCode::CONFLICT);
+        assert_eq!(post_json(&app, "/v1/locations", &h, loc("X", "bad code!")).await.0, StatusCode::BAD_REQUEST);
+
+        let uri = format!("/v1/locations/{}", main["id"].as_str().unwrap());
+        let edit = serde_json::json!({ "expected_revision": 1, "name": "Main shop (front)", "code": "MAIN", "location_type": "shop" });
+        let (s, up) = put_json(&app, &uri, &h, edit.clone()).await;
+        assert_eq!((s, up["revision"].as_i64(), up["name"].as_str()), (StatusCode::OK, Some(2), Some("Main shop (front)")));
+        let (s, e) = put_json(&app, &uri, &h, edit).await; // same stale revision again
+        assert_eq!((s, e["error"].as_str()), (StatusCode::CONFLICT, Some("stale_revision")));
+        let no_rev = serde_json::json!({ "name": "No revision", "code": "MAIN" });
+        assert_eq!(put_json(&app, &uri, &h, no_rev).await.0, StatusCode::CONFLICT, "a missing revision is treated as stale");
+
+        // the plan allows 5 active locations: main plus 4 more fit, the 6th is refused
+        for (i, c) in ["G1", "G2", "G3", "G4"].iter().enumerate() {
+            assert_eq!(post_json(&app, "/v1/locations", &h, loc(&format!("Godown {i}"), c)).await.0, StatusCode::CREATED);
+        }
+        let (s, e) = post_json(&app, "/v1/locations", &h, loc("One too many", "G5")).await;
+        assert_eq!((s, e["error"].as_str()), (StatusCode::FORBIDDEN, Some("location_limit_reached")));
+        // deactivating one frees a slot ...
+        let (s, off) = post_json(&app, &format!("{uri}/deactivate"), &h, serde_json::json!({ "expected_revision": 2 })).await;
+        assert_eq!((s, off["is_active"].as_bool(), off["revision"].as_i64()), (StatusCode::OK, Some(false), Some(3)));
+        assert_eq!(post_json(&app, "/v1/locations", &h, loc("Fits now", "G5")).await.0, StatusCode::CREATED);
+        // ... and bringing the old one back is refused while the plan is full (no loophole)
+        let (s, e) = post_json(&app, &format!("{uri}/activate"), &h, serde_json::json!({ "expected_revision": 3 })).await;
+        assert_eq!((s, e["error"].as_str()), (StatusCode::FORBIDDEN, Some("location_limit_reached")));
+        // activating something that is already active is a harmless no-op even at the limit
+        let (_, g1) = get_json(&app, "/v1/locations", &h).await;
+        let g1 = g1.as_array().unwrap().iter().find(|l| l["code"] == "G1").unwrap().clone();
+        let (s, same) = post_json(&app, &format!("/v1/locations/{}/activate", g1["id"].as_str().unwrap()), &h, serde_json::json!({ "expected_revision": g1["revision"] })).await;
+        assert_eq!((s, same["revision"].clone()), (StatusCode::OK, g1["revision"].clone()));
+        // free a slot again and the old location returns
+        post_json(&app, &format!("/v1/locations/{}/deactivate", g1["id"].as_str().unwrap()), &h, serde_json::json!({ "expected_revision": g1["revision"] })).await;
+        let (s, on) = post_json(&app, &format!("{uri}/activate"), &h, serde_json::json!({ "expected_revision": 3 })).await;
+        assert_eq!((s, on["is_active"].as_bool()), (StatusCode::OK, Some(true)));
+    }
+
+    #[tokio::test]
+    async fn users_see_and_edit_only_the_locations_they_have() {
+        let (app, writer, _) = make();
+        add_locations(&writer);
+        let (id, secret, ob) = owner(&app, &writer).await;
+        let oh = authed(&id, &secret, &ob);
+        let (uid, _, cashier) = user_with_role(&app, &id, &secret, &ob, "cashier1", &["sales.view"]).await;
+        let (mid, _, mgr) = user_with_role(&app, &id, &secret, &ob, "locmgr", &["locations.manage"]).await;
+        put_json(&app, &format!("/v1/users/{uid}/locations"), &oh, serde_json::json!({ "location_ids": ["main"] })).await;
+        put_json(&app, &format!("/v1/users/{mid}/locations"), &oh, serde_json::json!({ "location_ids": ["g1"] })).await;
+
+        let ch = authed(&id, &secret, &cashier);
+        let (s, list) = get_json(&app, "/v1/locations", &ch).await;
+        assert_eq!(s, StatusCode::OK);
+        let ids: Vec<&str> = list.as_array().unwrap().iter().map(|l| l["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["main"], "no permission needed to list, but only your locations come back");
+        assert_eq!(get_json(&app, "/v1/locations/main", &ch).await.0, StatusCode::OK);
+        for uri in ["/v1/locations/g1", "/v1/locations/does-not-exist"] {
+            let (s, e) = get_json(&app, uri, &ch).await;
+            assert_eq!((s, e["reason"].as_str()), (StatusCode::FORBIDDEN, Some("location_denied")), "{uri}: no way to probe ids");
+        }
+        assert_eq!(get_json(&app, "/v1/locations/does-not-exist", &oh).await.0, StatusCode::NOT_FOUND, "owners can tell it is missing");
+
+        // a location manager limited to g1 can edit g1 but not main, and cannot create locations
+        let mh = authed(&id, &secret, &mgr);
+        let (_, g1) = get_json(&app, "/v1/locations/g1", &mh).await;
+        let body = |rev: i64| serde_json::json!({ "expected_revision": rev, "name": "Godown One", "code": "G1" });
+        let (s, e) = put_json(&app, "/v1/locations/main", &mh, body(1)).await;
+        assert_eq!((s, e["reason"].as_str()), (StatusCode::FORBIDDEN, Some("location_denied")));
+        assert_eq!(put_json(&app, "/v1/locations/g1", &mh, body(g1["revision"].as_i64().unwrap())).await.0, StatusCode::OK);
+        let (s, e) = post_json(&app, "/v1/locations", &mh, serde_json::json!({ "name": "New", "code": "NEW" })).await;
+        assert_eq!((s, e["reason"].as_str()), (StatusCode::FORBIDDEN, Some("needs_all_locations")));
+    }
+
+    #[tokio::test]
+    async fn products_and_categories_work_end_to_end() {
+        let (app, writer, _) = make();
+        let (id, secret, ob) = owner(&app, &writer).await;
+        let h = authed(&id, &secret, &ob);
+        let (s, cat) = post_json(&app, "/v1/categories", &h, serde_json::json!({ "name": "Brakes" })).await;
+        assert_eq!(s, StatusCode::CREATED);
+        let cid = cat["id"].as_str().unwrap().to_string();
+        assert_eq!(post_json(&app, "/v1/categories", &h, serde_json::json!({ "name": "brakes" })).await.0, StatusCode::CONFLICT);
+        let (s, ren) = put_json(&app, &format!("/v1/categories/{cid}"), &h, serde_json::json!({ "expected_revision": 1, "name": "Brake parts" })).await;
+        assert_eq!((s, ren["revision"].as_i64()), (StatusCode::OK, Some(2)));
+
+        let new = |sku: &str, name: &str| serde_json::json!({ "sku": sku, "name": name, "barcode": null, "category_id": cid, "unit": "set" });
+        let (s, p) = post_json(&app, "/v1/products", &h, new("bp-100", "Brake pad front")).await;
+        assert_eq!(s, StatusCode::CREATED, "{p}");
+        assert_eq!((p["sku"].as_str(), p["unit"].as_str(), p["revision"].as_i64()), (Some("BP-100"), Some("set"), Some(1)));
+        assert_eq!(post_json(&app, "/v1/products", &h, new("BP-100", "Dup")).await.0, StatusCode::CONFLICT);
+        assert_eq!(post_json(&app, "/v1/products", &h, new("BP 200", "Bad sku")).await.0, StatusCode::BAD_REQUEST);
+        post_json(&app, "/v1/products", &h, new("BP-200", "Brake pad rear")).await;
+        post_json(&app, "/v1/products", &h, serde_json::json!({ "sku": "OF-1", "name": "Oil filter" })).await;
+
+        let (s, page) = get_json(&app, "/v1/products?search=brake&limit=1", &authed(&id, &secret, &ob)).await;
+        assert_eq!((s, page["total"].as_i64(), page["items"].as_array().unwrap().len()), (StatusCode::OK, Some(2), 1));
+        let (_, by_cat) = get_json(&app, &format!("/v1/products?category_id={cid}"), &h).await;
+        assert_eq!(by_cat["total"], 2);
+
+        let pid = p["id"].as_str().unwrap();
+        let (s, one) = get_json(&app, &format!("/v1/products/{pid}"), &h).await;
+        assert_eq!((s, one["name"].as_str()), (StatusCode::OK, Some("Brake pad front")));
+        assert_eq!(get_json(&app, "/v1/products/ghost", &h).await.0, StatusCode::NOT_FOUND);
+
+        let upd = |rev: i64| serde_json::json!({ "expected_revision": rev, "sku": "BP-100", "name": "Brake pad front (new)", "unit": "set" });
+        let (s, u) = put_json(&app, &format!("/v1/products/{pid}"), &h, upd(1)).await;
+        assert_eq!((s, u["revision"].as_i64()), (StatusCode::OK, Some(2)));
+        let (s, e) = put_json(&app, &format!("/v1/products/{pid}"), &h, upd(1)).await;
+        assert_eq!((s, e["error"].as_str()), (StatusCode::CONFLICT, Some("stale_revision")));
+
+        let (s, off) = post_json(&app, &format!("/v1/products/{pid}/deactivate"), &h, serde_json::json!({ "expected_revision": 2 })).await;
+        assert_eq!((s, off["is_active"].as_bool()), (StatusCode::OK, Some(false)));
+        let (_, hidden) = get_json(&app, "/v1/products?search=brake", &h).await;
+        assert_eq!(hidden["total"], 1);
+        let (_, shown) = get_json(&app, "/v1/products?search=brake&include_inactive=true", &h).await;
+        assert_eq!(shown["total"], 2);
+        let (s, on) = post_json(&app, &format!("/v1/products/{pid}/activate"), &h, serde_json::json!({ "expected_revision": 3 })).await;
+        assert_eq!((s, on["is_active"].as_bool()), (StatusCode::OK, Some(true)));
+    }
+
+    #[tokio::test]
+    async fn customers_work_end_to_end() {
+        let (app, writer, _) = make();
+        let (id, secret, ob) = owner(&app, &writer).await;
+        let h = authed(&id, &secret, &ob);
+        let (s, a) = post_json(&app, "/v1/customers", &h, serde_json::json!({ "name": "Ali Traders", "phone": "0300-1234567" })).await;
+        assert_eq!((s, a["code"].as_str()), (StatusCode::CREATED, Some("C00001")));
+        let (_, b) = post_json(&app, "/v1/customers", &h, serde_json::json!({ "name": "Bilal Motors" })).await;
+        assert_eq!(b["code"], "C00002");
+        assert_eq!(post_json(&app, "/v1/customers", &h, serde_json::json!({ "name": "x" })).await.0, StatusCode::BAD_REQUEST);
+        let (_, found) = get_json(&app, "/v1/customers?search=1234567", &h).await;
+        assert_eq!((found["total"].as_i64(), found["items"][0]["name"].as_str()), (Some(1), Some("Ali Traders")));
+        let aid = a["id"].as_str().unwrap();
+        let upd = |rev: i64| serde_json::json!({ "expected_revision": rev, "name": "Ali Traders & Sons", "phone": "0300-1234567" });
+        let (s, u) = put_json(&app, &format!("/v1/customers/{aid}"), &h, upd(1)).await;
+        assert_eq!((s, u["revision"].as_i64(), u["code"].as_str()), (StatusCode::OK, Some(2), Some("C00001")));
+        assert_eq!(put_json(&app, &format!("/v1/customers/{aid}"), &h, upd(1)).await.1["error"], "stale_revision");
+        let (s, off) = post_json(&app, &format!("/v1/customers/{aid}/deactivate"), &h, serde_json::json!({ "expected_revision": 2 })).await;
+        assert_eq!((s, off["is_active"].as_bool()), (StatusCode::OK, Some(false)));
+        assert_eq!(get_json(&app, "/v1/customers", &h).await.1["total"], 1);
+        assert_eq!(get_json(&app, &format!("/v1/customers/{aid}"), &h).await.0, StatusCode::OK, "inactive customers can still be fetched by id");
+    }
+
+    #[tokio::test]
+    async fn master_data_needs_the_matching_permission() {
+        let (app, writer, _) = make();
+        let (id, secret, ob) = owner(&app, &writer).await;
+        let (_, _, viewer) = user_with_role(&app, &id, &secret, &ob, "viewer", &["products.view", "customers.view"]).await;
+        let (_, _, nobody) = user_with_role(&app, &id, &secret, &ob, "nobody", &["sales.view"]).await;
+        let vh = authed(&id, &secret, &viewer);
+        let nh = authed(&id, &secret, &nobody);
+        assert_eq!(get_json(&app, "/v1/products", &vh).await.0, StatusCode::OK);
+        assert_eq!(get_json(&app, "/v1/customers", &vh).await.0, StatusCode::OK);
+        assert_eq!(get_json(&app, "/v1/categories", &vh).await.0, StatusCode::OK);
+        for (uri, body) in [
+            ("/v1/products", serde_json::json!({ "sku": "A1", "name": "Part" })),
+            ("/v1/customers", serde_json::json!({ "name": "Someone" })),
+            ("/v1/categories", serde_json::json!({ "name": "Cat" })),
+            ("/v1/locations", serde_json::json!({ "name": "Place", "code": "PL" })),
+        ] {
+            let (s, e) = post_json(&app, uri, &vh, body).await;
+            assert_eq!((s, e["reason"].as_str()), (StatusCode::FORBIDDEN, Some("no_permission")), "viewers cannot write {uri}");
+        }
+        for uri in ["/v1/products", "/v1/customers", "/v1/categories"] {
+            let (s, e) = get_json(&app, uri, &nh).await;
+            assert_eq!((s, e["reason"].as_str()), (StatusCode::FORBIDDEN, Some("no_permission")), "{uri}");
+        }
+        let bad = authed(&id, &secret, "Bearer nonsense");
+        let (s, e) = get_json(&app, "/v1/products", &bad).await;
+        assert_eq!((s, e["error"].as_str()), (StatusCode::UNAUTHORIZED, Some("session_required")));
+    }
+
+    #[tokio::test]
+    async fn suspension_stops_master_data_writes_but_not_reads_and_pin_sessions_may_edit() {
+        let (app, writer, _) = make();
+        let (id, secret, ob) = owner(&app, &writer).await;
+        let h = authed(&id, &secret, &ob);
+        post_json(&app, "/v1/me/pin", &h, serde_json::json!({ "current_password": PW, "pin": "2580" })).await;
+        let (_, l) = post_json(&app, "/v1/auth/login", &creds(&id, &secret), serde_json::json!({ "username": "boss", "pin": "2580" })).await;
+        let pin_bearer = bearer(l["token"].as_str().unwrap());
+        let ph = authed(&id, &secret, &pin_bearer);
+        let (s, c) = post_json(&app, "/v1/customers", &ph, serde_json::json!({ "name": "Counter customer" })).await;
+        assert_eq!(s, StatusCode::CREATED, "a PIN session at the counter may add customers: {c}");
+        post_json(&app, "/v1/products", &h, serde_json::json!({ "sku": "A1", "name": "Existing part" })).await;
+
+        apply_env(&writer, "suspended_rev2").unwrap();
+        for uri in ["/v1/products", "/v1/customers", "/v1/categories", "/v1/locations"] {
+            assert_eq!(get_json(&app, uri, &h).await.0, StatusCode::OK, "reads continue: {uri}");
+        }
+        for (uri, body) in [
+            ("/v1/products", serde_json::json!({ "sku": "A2", "name": "New part" })),
+            ("/v1/customers", serde_json::json!({ "name": "New customer" })),
+            ("/v1/categories", serde_json::json!({ "name": "New category" })),
+            ("/v1/locations", serde_json::json!({ "name": "New place", "code": "NP" })),
+        ] {
+            let (s, e) = post_json(&app, uri, &h, body).await;
+            assert_eq!((s, e["error"].as_str(), e["reason"].as_str()), (StatusCode::PAYMENT_REQUIRED, Some("subscription_inactive"), Some("suspended")), "{uri}");
+        }
+        let cid = c["id"].as_str().unwrap();
+        let (s, _) = put_json(&app, &format!("/v1/customers/{cid}"), &h, serde_json::json!({ "expected_revision": 1, "name": "Renamed" })).await;
+        assert_eq!(s, StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn every_master_data_change_is_queued_for_sync_in_the_same_transaction() {
+        let (app, writer, _) = make();
+        let (id, secret, ob) = owner(&app, &writer).await;
+        let h = authed(&id, &secret, &ob);
+        let (_, p) = post_json(&app, "/v1/products", &h, serde_json::json!({ "sku": "A1", "name": "Part one" })).await;
+        post_json(&app, &format!("/v1/products/{}/deactivate", p["id"].as_str().unwrap()), &h, serde_json::json!({ "expected_revision": 1 })).await;
+        post_json(&app, "/v1/products", &h, serde_json::json!({ "sku": "A1", "name": "Duplicate refused" })).await; // refused: must not enqueue
+        let rows: Vec<(String, String, Option<i64>)> = writer
+            .run(|c| {
+                let mut st = c.prepare("SELECT entity, op, base_revision FROM sync_outbox ORDER BY rowid")?;
+                let r = st.query_map([], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)))?;
+                Ok(r.collect::<Result<Vec<_>, _>>()?)
+            })
+            .unwrap();
+        assert_eq!(rows, vec![("product".into(), "insert".into(), None), ("product".into(), "archive".into(), Some(1))]);
     }
 }
