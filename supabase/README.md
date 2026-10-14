@@ -8,7 +8,7 @@ Apply migrations in order in the SQL Editor; each has a test script in `tests/` 
 | 0002 | revoke anon access | (covered by rls_test #22) | applied and verified |
 | 0003 | fix: location/product ownership checks | `rls_test.sql` (24 checks) | applied and verified |
 | 0004 | plans, tenant_subscriptions, platform_admins, audit, `superadmin_set_subscription`, `tenant_entitlement_payload` | `superadmin_test.sql` (20 checks) | applied and verified on project `apo` (20/20) |
-| 0005 | customers (read-only via RLS), category revisions, unique barcode per shop | `customers_test.sql` (17 checks) | written; dry-run verified on `apo`, not applied yet |
+| 0005 | customers (read-only via RLS), category revisions, unique barcode per shop | `customers_test.sql` (17 checks) | applied and verified on project `apo` (17/17) |
 
 **Security model:** RLS enabled and forced on every table; clients have SELECT only; writes go through `SECURITY DEFINER` RPCs that check
 membership, tenant status, permission, scope and idempotency. Mobile talks to these directly. Service-role key lives only in the Worker.

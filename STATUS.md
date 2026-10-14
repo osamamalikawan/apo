@@ -19,7 +19,7 @@ build sandbox only. "Verified (apo project)" = run against the live Supabase pro
 | `crates/lan-api` shared `authz::check` + role/user admin endpoints | Verified (sandbox) | `cargo test -p dsaas-lan-api`: 52 passed (39 + 4 authz + 9 new). Live HTTPS smoke test: create role, typo rejected, assign, cashier refused, Owner protected, audit trail written. Owner re-run pending |
 | `crates/db` master data: `locations`, `catalog` (categories, products), `customers` + SQLite migration 0005 | Verified (sandbox) | `cargo test -p dsaas-db`: 67 passed (44 + 23 new). Mutation checks: disabling the stale-revision check fails 7 tests, disabling the stock guard fails its test. Owner re-run pending |
 | `crates/lan-api` master-data endpoints (`master_api`) | Verified (sandbox) | `cargo test -p dsaas-lan-api`: 60 passed (52 + 1 authz + 7 new): plan limits, location scope, revisions, permissions, suspension, outbox. Owner re-run pending |
-| Supabase 0005 customers + catalog (`0005_customers_and_catalog.sql`) | Dry-run verified on project `apo`, NOT applied | `customers_test.sql`: ALL 17 CHECKS PASSED inside a block that included the migration itself; afterwards `apo` had no new table, column or index |
+| Supabase 0005 customers + catalog (`0005_customers_and_catalog.sql`) | Verified (apo project) | Applied by the owner; `customers_test.sql` run by the owner: ALL 17 CHECKS PASSED. Afterwards the table, category `revision` column, barcode index and no-delete function exist on `apo`, RLS is enabled and forced, `anon` cannot read, `authenticated` can read but not insert, and no test rows remain |
 | Supabase 0001-0003 | Verified (owner) | `rls_test.sql`: 24/24 |
 | Supabase 0004 subscriptions + Super Admin functions | Verified (apo project) | `superadmin_test.sql`: ALL 20 CHECKS PASSED, after one live fix (see findings). Objects were already applied; the test left no data behind |
 | Dev license tools | Verified (sandbox) | signatures cross-checked by Node crypto; deterministic vectors |
@@ -28,8 +28,7 @@ build sandbox only. "Verified (apo project)" = run against the live Supabase pro
 ## Pending checks (owner)
 Done on the owner's machine (before the roles patch): `cargo test` db (29) and lan-api (39), Python SQLite (23), domain node test (40).
 After applying the master-data patch, re-run `cargo test -p dsaas-db` (expect 67) and `cargo test -p dsaas-lan-api` (expect 60).
-1. Apply `supabase/migrations/0005_customers_and_catalog.sql` in the Supabase SQL Editor (not applied yet), then run `supabase/tests/customers_test.sql` (expect "ALL 17 CHECKS PASSED").
-2. Live demo with sign-in: `node tools/issue-entitlement.mjs dev-tenant active 30 3 1 --out ent.json`, then in PowerShell from `src-tauri`:
+1. Live demo with sign-in: `node tools/issue-entitlement.mjs dev-tenant active 30 3 1 --out ent.json`, then in PowerShell from `src-tauri`:
    `$env:DSAAS_ADMIN_PASSWORD = "a long password"; cargo run -p dsaas-lan-api --bin lan-server -- --apply-entitlement ..\..\..\ent.json`
    (expect `license : full (active)` and `owner login  : admin: password set ...`).
 
