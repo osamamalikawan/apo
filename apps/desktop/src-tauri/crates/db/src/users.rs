@@ -624,6 +624,26 @@ pub fn set_password_local(
     Ok(())
 }
 
+/// Someone who can sign in with a PIN on the sign-in screen.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LoginUser {
+    pub id: String,
+    pub username: String,
+    pub full_name: String,
+}
+
+/// Active users who have a PIN set, for the "who are you?" tiles of a PIN-style sign-in screen.
+/// Only meant for paired devices: it reveals user names (never anything secret) to whoever sits at a
+/// shop PC, the same trade-off every counter PIN screen makes.
+pub fn pin_login_users(conn: &Connection, tenant: &str) -> Result<Vec<LoginUser>, DbError> {
+    let mut st = conn.prepare(
+        "SELECT id, username, full_name FROM users
+         WHERE tenant_id=?1 AND is_active=1 AND pin_hash IS NOT NULL ORDER BY lower(full_name), username",
+    )?;
+    let rows = st.query_map([tenant], |r| Ok(LoginUser { id: r.get(0)?, username: r.get(1)?, full_name: r.get(2)? }))?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
 /// Deactivate a user (users are never deleted: history must stay attributable) and end their sessions.
 /// Refuses to deactivate the last active user that holds the all-permissions ("*") grant.
 pub fn deactivate_user(
@@ -900,6 +920,24 @@ mod tests {
         assert!(pw_login(&mut c, "boss", "recovered password", &at(3)).is_ok());
         assert!(matches!(set_password_local(&mut c, "t1", "ghost", "recovered password", T0), Err(UserError::NotFound)));
         assert!(matches!(set_password_local(&mut c, "t1", &boss, "short", T0), Err(UserError::BadInput(_))));
+    }
+
+    #[test]
+    fn the_pin_tile_list_has_only_active_users_with_a_pin_and_no_secrets() {
+        let (mut c, boss) = setup();
+        assert!(pin_login_users(&c, "t1").unwrap().is_empty(), "nobody has a PIN yet");
+        set_pin(&mut c, "t1", &boss, Some("d1"), GOOD, "2580", T0).unwrap();
+        let cashier = create_user(&mut c, "t1", Some(&boss), None, "cashier1", "Anwar Cashier", "cashier password", T0).unwrap();
+        create_user(&mut c, "t1", Some(&boss), None, "nopin", "No Pin Person", "nopin password 1", T0).unwrap();
+        set_pin(&mut c, "t1", &cashier, None, "cashier password", "1357", T0).unwrap();
+        let names: Vec<String> = pin_login_users(&c, "t1").unwrap().into_iter().map(|u| u.full_name).collect();
+        assert_eq!(names, ["Anwar Cashier", "The Boss"], "sorted by name; the user without a PIN is absent");
+        deactivate_user(&mut c, "t1", &boss, None, &cashier, T0).unwrap();
+        assert_eq!(pin_login_users(&c, "t1").unwrap().len(), 1, "deactivated users disappear");
+        let json = serde_json::to_string(&pin_login_users(&c, "t1").unwrap()).unwrap();
+        assert!(!json.contains("argon2") && !json.contains("hash"));
+        c.execute("INSERT INTO tenants(id,name) VALUES ('t2','Other')", []).unwrap();
+        assert!(pin_login_users(&c, "t2").unwrap().is_empty(), "other shops' users never appear");
     }
 
     #[test]

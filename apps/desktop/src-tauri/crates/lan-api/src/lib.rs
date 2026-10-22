@@ -443,8 +443,19 @@ async fn license_status(State(st): State<AppState>) -> Result<Json<serde_json::V
     })))
 }
 
-async fn whoami(State(st): State<AppState>, Extension(d): Extension<AuthedDevice>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "device_id": d.0, "tenant_id": &*st.tenant_id }))
+async fn whoami(State(st): State<AppState>, Extension(d): Extension<AuthedDevice>) -> Result<Json<serde_json::Value>, ApiError> {
+    let tenant = st.tenant_id.to_string();
+    let name: String = db(&st, move |c| {
+        Ok(c.query_row("SELECT name FROM tenants WHERE id=?1", [&tenant], |r| r.get(0)).unwrap_or_default())
+    })
+    .await?;
+    Ok(Json(serde_json::json!({ "device_id": d.0, "tenant_id": &*st.tenant_id, "tenant_name": name })))
+}
+
+/// The tiles of the PIN sign-in screen: active users who have a PIN. Device-authenticated only.
+async fn login_users(State(st): State<AppState>) -> Result<Json<Vec<users::LoginUser>>, ApiError> {
+    let tenant = st.tenant_id.to_string();
+    Ok(Json(db(&st, move |c| users::pin_login_users(c, &tenant)).await?))
 }
 
 pub fn router(state: AppState) -> Router {
@@ -461,6 +472,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/whoami", get(whoami))
         .route("/v1/license/status", get(license_status))
         .route("/v1/auth/login", post(login))
+        .route("/v1/login-users", get(login_users))
         .merge(sessioned)
         .route_layer(middleware::from_fn_with_state(state.clone(), require_device));
     let versioned = Router::new()
@@ -1483,5 +1495,24 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows, vec![("product".into(), "insert".into(), None), ("product".into(), "archive".into(), Some(1))]);
+    }
+
+    #[tokio::test]
+    async fn the_sign_in_screen_can_list_pin_users_and_the_shop_name() {
+        let (app, writer, _) = make();
+        // device credentials are required, like every /v1 route
+        let (s, _) = call(&app, req("GET", "/v1/login-users", &[V1], None)).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        let (id, secret, token) = owner_session(&app, &writer).await;
+        let d = creds(&id, &secret);
+        let (s, v) = call(&app, req("GET", "/v1/login-users", &d, None)).await;
+        assert_eq!((s, v.as_array().unwrap().len()), (StatusCode::OK, 0), "nobody has a PIN yet");
+        let b = bearer(&token);
+        post_json(&app, "/v1/me/pin", &authed(&id, &secret, &b), serde_json::json!({ "current_password": PW, "pin": "2580" })).await;
+        let (_, v) = call(&app, req("GET", "/v1/login-users", &d, None)).await;
+        assert_eq!(v, serde_json::json!([{ "id": v[0]["id"], "username": "boss", "full_name": "The Boss" }]));
+        assert!(!v.to_string().contains("hash"));
+        let (s, w) = call(&app, req("GET", "/v1/whoami", &d, None)).await;
+        assert_eq!((s, w["tenant_name"].is_string(), w["tenant_id"].as_str()), (StatusCode::OK, true, Some("t1")));
     }
 }

@@ -23,4 +23,5 @@ Status: accepted. Hard to reverse because clients, stored hashes and audit histo
 ## Consequences
 - New users have no permissions until the roles module (build step 2) lets an owner assign roles.
 - There is no per-IP rate limit yet; the per-account lockout is the only brute-force control (listed in STATUS).
+- The PIN sign-in screen lists PIN users through `GET /v1/login-users` (ADR 0010): device credentials only, names only.
 - Session tokens travel in an `Authorization: Bearer` header over the pinned HTTPS channel (ADR 0005).

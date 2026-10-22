@@ -8,6 +8,7 @@ Local-first, multi-tenant desktop SaaS for distributors. Architecture: see the P
 - `packages/domain` shared TypeScript rules (money, permissions, reference stock ledger)
 - `packages/test-vectors` JSON cases shared by TypeScript, SQLite and (later) Postgres tests
 - `apps/desktop/src-tauri/crates/db` shop-server SQLite migrations and Rust access layer
+- `apps/desktop` the React UI (try it with `npm run dev:ui:mock`; see its README)
 - `supabase/migrations` cloud schema, RLS, RPC
 - `tools/` cross-language test runners
 
@@ -23,6 +24,7 @@ git apply some.patch
 tsc -p packages/domain/tsconfig.json                  # typecheck
 node --experimental-strip-types --test packages/domain/test/domain.test.ts   # domain tests (Node 22.14; plain `node --test` works on 22.18+)
 python3 tools/test_sqlite_ledger.py                   # real SQLite schema tests
+npm install && npm run test:ui                        # desktop UI tests (needs Node 22.12 or newer)
 node tools/gen-entitlement-vectors.mjs                # regenerate signed test vectors (deterministic)
 ```
 Rust (needs a toolchain): `cd apps/desktop/src-tauri && cargo test -p dsaas-db`

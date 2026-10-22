@@ -7,6 +7,11 @@
     "typecheck": "tsc -p packages/domain/tsconfig.json",
     "test:domain": "node --experimental-strip-types --test packages/domain/test/domain.test.ts",
     "test:sqlite": "python3 tools/test_sqlite_ledger.py",
-    "test": "npm run typecheck && npm run test:domain && npm run test:sqlite"
+    "dev:ui": "npm run dev -w apps/desktop",
+    "dev:ui:mock": "npm run dev:mock -w apps/desktop",
+    "typecheck:ui": "npm run typecheck -w apps/desktop",
+    "test:ui": "npm test -w apps/desktop",
+    "build:ui": "npm run build -w apps/desktop",
+    "test": "npm run typecheck && npm run typecheck:ui && npm run test:domain && npm run test:sqlite && npm run test:ui"
   }
 }

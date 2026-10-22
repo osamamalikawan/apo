@@ -15,7 +15,7 @@ panel that can revoke subscriptions remotely. Read `docs/adr/` for the why; `STA
 | Cloud (Postgres) | `supabase/` | schema, RLS, RPCs, Super Admin functions, SQL tests | its README |
 | Dev tools | `tools/` | SQLite test runner, dev license signer, vector generator | its README |
 | Cloudflare Worker | `services/worker` | **not started** (signs entitlements, sync gateway) | ADR 0003, 0006 |
-| Desktop UI | `apps/desktop` (React in `src/`) | **not started** | |
+| Desktop UI | `apps/desktop` (React in `src/`) | sign-in, shell, dashboard, customers, inventory (products, locations), settings (account, users, roles); the rest are "Coming soon" pages | its README, ADR 0010 |
 | Super Admin portal | `apps/superadmin` | **not started** | ADR 0006 |
 | Mobile app | `apps/mobile` | **not started** (later) | ADR 0003 |
 
@@ -60,7 +60,7 @@ reach it). 3. Rules in `packages/domain` + vectors. 4. Service functions in `cra
 middleware (permission + location/route scope + entitlement)~~ **done, see ADR 0008** ~~3. Master data: locations, products, customers~~ **done, see ADR 0009**
 4. Inventory service: transfers, counts, reservations (spec in the original multi-location brief)
 5. Sales, payments, accounts ledger 6. Sync engine (outbox/inbox, hourly + manual, conflicts)
-7. Cloudflare Worker (auth, sync, entitlement signing) 8. Tauri shell + React UI (header: version, sync status)
+7. Cloudflare Worker (auth, sync, entitlement signing) 8. Tauri shell + React UI (header: version, sync status) (**React UI foundation started, see ADR 0010; Tauri shell not built**)
 9. Super Admin portal 10. Routes, weekly planner, targets, reports 11. Mobile app 12. Installer + signed updater.
 
 ## Command cheat sheet (Windows PowerShell)
@@ -70,6 +70,7 @@ middleware (permission + location/route scope + entitlement)~~ **done, see ADR 0
 | project root | `tsc -p packages/domain/tsconfig.json` (or `npx -p typescript tsc -p packages/domain/tsconfig.json`) |
 | project root | `node --experimental-strip-types --test packages/domain/test/domain.test.ts` (Node 22.14; plain `node --test ...` on 22.18+) |
 | project root | `git apply --check x.patch` then `git apply x.patch` |
+| project root | `npm install` once, then `npm run test:ui`, `npm run typecheck:ui`, `npm run dev:ui:mock` (demo shop), `npm run dev:ui` (real server, after `node tools/dev-pair.mjs <code>`) |
 | `apps\desktop\src-tauri` | `cargo test -p dsaas-db` and `cargo test -p dsaas-lan-api` |
 | `apps\desktop\src-tauri` | `cargo run -p dsaas-lan-api --bin lan-server -- [--lan] [--apply-entitlement file]` |
 | Supabase SQL Editor | paste `supabase/migrations/000N_*.sql`, then the matching file in `supabase/tests/` |
