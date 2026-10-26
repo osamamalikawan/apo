@@ -3,12 +3,17 @@
 //! Rules: only the server process opens this file; all writes go through one writer thread;
 //! migrations run inside a transaction after a backup.
 
+pub mod brands;
 pub mod catalog;
+pub mod counts;
 pub mod customers;
+pub mod inventory;
 pub mod locations;
 pub(crate) mod master;
 pub mod pairing;
 pub mod roles;
+pub mod stock;
+pub mod transfers;
 pub mod users;
 pub use rusqlite;
 
@@ -55,6 +60,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 5,
         name: "customers_and_catalog",
         sql: include_str!("../migrations/0005_customers_and_catalog.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "products_and_inventory",
+        sql: include_str!("../migrations/0006_products_and_inventory.sql"),
     },
 ];
 
@@ -152,8 +162,8 @@ mod tests {
     #[test]
     fn migrates_once_and_is_idempotent() {
         let mut c = open_in_memory().unwrap();
-        assert_eq!(migrate(&mut c).unwrap(), vec![1, 2, 3, 4, 5]);
-        assert_eq!(current_version(&c).unwrap(), 5);
+        assert_eq!(migrate(&mut c).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(current_version(&c).unwrap(), 6);
         assert!(migrate(&mut c).unwrap().is_empty());
     }
 

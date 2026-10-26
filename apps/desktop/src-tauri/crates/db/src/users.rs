@@ -40,6 +40,9 @@ pub enum UserError {
     /// The caller may not do this (for example grant permissions they do not hold themselves).
     #[error("{0}")]
     Forbidden(&'static str),
+    /// A stock bucket would go below zero: `have` is what is there, `need` what was asked for.
+    #[error("not enough stock")]
+    Short { product_id: String, location_id: String, have: i64, need: i64 },
     /// The record changed since the caller read it (optimistic concurrency): reload and retry.
     #[error("stale revision")]
     Stale,

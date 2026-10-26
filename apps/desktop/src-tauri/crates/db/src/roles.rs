@@ -31,6 +31,7 @@ pub const PERMISSIONS: &[(&str, &str)] = &[
     ("customers.view", "View customers"),
     ("customers.manage", "Create and edit customers"),
     ("inventory.view", "View stock"),
+    ("inventory.receive", "Receive stock (restock)"),
     ("inventory.transfer", "Move stock between locations"),
     ("inventory.adjust", "Adjust stock quantities"),
     ("inventory.count", "Run stock counts"),

@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { verify } from "../../../tools/dev-license-key.mjs";
 import { InMemoryLedger, transferMovements, authorize, hasPermission,
+  receiveStock, correctStock, damageStock, writeOffStock, dispatchTransfer, receiveTransfer, cancelTransfer, countAdjustments,
+  type PlannedMovement,
   evaluate, canWrite, isIsoSeconds,
   money, add, sub, fromDecimal, toDecimal, applyBps, allocate } from "../src/index.ts";
 
@@ -95,3 +97,41 @@ test("vector payloads carry the fields the server relies on", () => {
   for (const k of ["tenant_id", "revision", "status", "issued_at", "full_until", "grace_until", "limits"]) assert.ok(k in p, k);
   assert.ok(isIsoSeconds(p.issued_at) && isIsoSeconds(p.full_until) && isIsoSeconds(p.grace_until));
 });
+
+// ---- shared stock-operation vectors (the Rust inventory code runs the same file) ----
+const stockOps: Record<string, (i: any) => PlannedMovement[]> = {
+  receive: receiveStock, correct: correctStock, damage: damageStock, write_off: writeOffStock,
+  dispatch: dispatchTransfer, receive_transfer: receiveTransfer, cancel_transfer: cancelTransfer, count: countAdjustments,
+};
+const ops = vec("stock-operations.json");
+const wire = (m: PlannedMovement) => ({ location: m.locationId, product: m.productId, bucket: m.bucket, delta: m.delta, type: m.type, key: m.key });
+
+for (const c of ops.movements) {
+  test(`stock operation vector: ${c.name}`, () => {
+    assert.deepEqual(stockOps[c.op]!(c.input).map(wire), c.expect);
+  });
+}
+for (const c of ops.errors) {
+  test(`stock operation vector (refused): ${c.name}`, () => {
+    assert.throws(() => stockOps[c.op]!(c.input));
+  });
+}
+/** Post a whole operation or none of it, like the database transaction does. */
+function postAtomically(ledger: InMemoryLedger, ms: PlannedMovement[]): boolean {
+  const trial = new InMemoryLedger();
+  for (const m of ledger.movements) trial.post(m);
+  if (!ms.every((m) => trial.post(m) === "posted")) return false;
+  ms.forEach((m) => ledger.post(m));
+  return true;
+}
+for (const sc of ops.scenarios) {
+  test(`stock scenario: ${sc.name}`, () => {
+    const l = new InMemoryLedger();
+    for (const step of sc.steps) {
+      const ok = postAtomically(l, stockOps[step.op]!(step.input));
+      assert.equal(ok, !step.expectRejected, `step ${step.op}`);
+    }
+    for (const [k, want] of Object.entries(sc.balances)) assert.deepEqual(l.balance(...(k.split("|") as [string, string])), want, k);
+    for (const [k, b] of l.rebuild()) assert.deepEqual(l.balance(...(k.split("|") as [string, string])), b);
+  });
+}

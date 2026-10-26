@@ -1,0 +1,2699 @@
+diff --git a/apps/desktop/src-tauri/crates/db/migrations/0006_products_and_inventory.sql b/apps/desktop/src-tauri/crates/db/migrations/0006_products_and_inventory.sql
+new file mode 100644
+index 0000000..4bd81d6
+--- /dev/null
++++ b/apps/desktop/src-tauri/crates/db/migrations/0006_products_and_inventory.sql
+@@ -0,0 +1,148 @@
++-- Migration 0006: product details (company, brand, model, Urdu name, scheme) and the business tables for stock.
++-- The stock LEDGER itself (stock_movements, inventory_balances and their triggers) is from migration 0001; this adds
++-- the records that explain why stock moved: operations (restock/adjust), transfers and counts.
++
++-- ---------- companies and brands ----------
++CREATE TABLE companies (
++  id         TEXT PRIMARY KEY,
++  tenant_id  TEXT NOT NULL REFERENCES tenants(id),
++  name       TEXT NOT NULL,
++  is_active  INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
++  revision   INTEGER NOT NULL DEFAULT 1,
++  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
++  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
++  UNIQUE (tenant_id, id)
++);
++CREATE UNIQUE INDEX companies_name_unique ON companies(tenant_id, lower(name));
++
++CREATE TABLE brands (
++  id         TEXT PRIMARY KEY,
++  tenant_id  TEXT NOT NULL REFERENCES tenants(id),
++  name       TEXT NOT NULL,
++  company_id TEXT,
++  is_active  INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
++  revision   INTEGER NOT NULL DEFAULT 1,
++  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
++  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
++  UNIQUE (tenant_id, id),
++  FOREIGN KEY (tenant_id, company_id) REFERENCES companies(tenant_id, id)
++);
++CREATE UNIQUE INDEX brands_name_unique ON brands(tenant_id, lower(name));
++
++-- ---------- product details ----------
++-- SQLite cannot add a composite foreign key to an existing table, so company_id/brand_id use single-column
++-- references plus triggers that insist the company/brand belongs to the same shop.
++ALTER TABLE products ADD COLUMN name_ur TEXT;
++ALTER TABLE products ADD COLUMN model TEXT;
++ALTER TABLE products ADD COLUMN company_id TEXT REFERENCES companies(id);
++ALTER TABLE products ADD COLUMN brand_id TEXT REFERENCES brands(id);
++-- A scheme is "buy N, get M free": both numbers or neither. (A CHECK passes on NULL, hence the explicit IS NOT NULL.)
++ALTER TABLE products ADD COLUMN scheme_buy INTEGER CHECK (scheme_buy IS NULL OR scheme_buy >= 1);
++ALTER TABLE products ADD COLUMN scheme_free INTEGER
++  CHECK ((scheme_buy IS NULL AND scheme_free IS NULL) OR (scheme_buy IS NOT NULL AND scheme_free IS NOT NULL AND scheme_free >= 1));
++
++CREATE TRIGGER products_company_same_tenant_ins BEFORE INSERT ON products
++WHEN NEW.company_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM companies WHERE id = NEW.company_id AND tenant_id = NEW.tenant_id)
++BEGIN SELECT RAISE(ABORT,'company belongs to another shop'); END;
++CREATE TRIGGER products_company_same_tenant_upd BEFORE UPDATE OF company_id, tenant_id ON products
++WHEN NEW.company_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM companies WHERE id = NEW.company_id AND tenant_id = NEW.tenant_id)
++BEGIN SELECT RAISE(ABORT,'company belongs to another shop'); END;
++CREATE TRIGGER products_brand_same_tenant_ins BEFORE INSERT ON products
++WHEN NEW.brand_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM brands WHERE id = NEW.brand_id AND tenant_id = NEW.tenant_id)
++BEGIN SELECT RAISE(ABORT,'brand belongs to another shop'); END;
++CREATE TRIGGER products_brand_same_tenant_upd BEFORE UPDATE OF brand_id, tenant_id ON products
++WHEN NEW.brand_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM brands WHERE id = NEW.brand_id AND tenant_id = NEW.tenant_id)
++BEGIN SELECT RAISE(ABORT,'brand belongs to another shop'); END;
++
++-- ---------- stock operations: restock and adjustments (one product per row) ----------
++-- kind: receive (+qty), correction (+/- qty), damage (qty moves on_hand -> damaged), write_off (qty leaves damaged).
++CREATE TABLE stock_operations (
++  id              TEXT PRIMARY KEY,
++  tenant_id       TEXT NOT NULL REFERENCES tenants(id),
++  kind            TEXT NOT NULL CHECK (kind IN ('receive','correction','damage','write_off')),
++  location_id     TEXT NOT NULL,
++  product_id      TEXT NOT NULL,
++  qty             INTEGER NOT NULL CHECK (qty <> 0),
++  note            TEXT,
++  reference       TEXT,
++  actor_id        TEXT,
++  device_id       TEXT,
++  idempotency_key TEXT NOT NULL,
++  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
++  UNIQUE (tenant_id, id),
++  UNIQUE (tenant_id, idempotency_key),
++  FOREIGN KEY (tenant_id, location_id) REFERENCES stock_locations(tenant_id, id),
++  FOREIGN KEY (tenant_id, product_id)  REFERENCES products(tenant_id, id)
++);
++CREATE INDEX stock_operations_by_product ON stock_operations(tenant_id, product_id, created_at);
++CREATE TRIGGER stock_operations_no_update BEFORE UPDATE ON stock_operations BEGIN SELECT RAISE(ABORT,'stock_operations is append-only'); END;
++CREATE TRIGGER stock_operations_no_delete BEFORE DELETE ON stock_operations BEGIN SELECT RAISE(ABORT,'stock_operations is append-only'); END;
++
++-- ---------- transfers: dispatch from one location, receive at another ----------
++CREATE TABLE stock_transfers (
++  id               TEXT PRIMARY KEY,
++  tenant_id        TEXT NOT NULL REFERENCES tenants(id),
++  number           TEXT NOT NULL,
++  from_location_id TEXT NOT NULL,
++  to_location_id   TEXT NOT NULL,
++  status           TEXT NOT NULL DEFAULT 'in_transit' CHECK (status IN ('in_transit','received','cancelled')),
++  note             TEXT,
++  created_by       TEXT,
++  created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
++  received_by      TEXT,
++  received_at      TEXT,
++  cancelled_by     TEXT,
++  cancelled_at     TEXT,
++  idempotency_key  TEXT NOT NULL,
++  revision         INTEGER NOT NULL DEFAULT 1,
++  UNIQUE (tenant_id, id),
++  UNIQUE (tenant_id, number),
++  UNIQUE (tenant_id, idempotency_key),
++  CHECK (from_location_id <> to_location_id),
++  FOREIGN KEY (tenant_id, from_location_id) REFERENCES stock_locations(tenant_id, id),
++  FOREIGN KEY (tenant_id, to_location_id)   REFERENCES stock_locations(tenant_id, id)
++);
++CREATE TRIGGER stock_transfers_no_delete BEFORE DELETE ON stock_transfers BEGIN SELECT RAISE(ABORT,'transfers cannot be deleted'); END;
++CREATE TABLE stock_transfer_items (
++  tenant_id   TEXT NOT NULL,
++  transfer_id TEXT NOT NULL,
++  product_id  TEXT NOT NULL,
++  qty         INTEGER NOT NULL CHECK (qty > 0),
++  PRIMARY KEY (transfer_id, product_id),
++  FOREIGN KEY (tenant_id, transfer_id) REFERENCES stock_transfers(tenant_id, id),
++  FOREIGN KEY (tenant_id, product_id)  REFERENCES products(tenant_id, id)
++);
++CREATE TRIGGER stock_transfer_items_no_update BEFORE UPDATE ON stock_transfer_items BEGIN SELECT RAISE(ABORT,'transfer lines cannot change'); END;
++CREATE TRIGGER stock_transfer_items_no_delete BEFORE DELETE ON stock_transfer_items BEGIN SELECT RAISE(ABORT,'transfer lines cannot change'); END;
++
++-- ---------- stock counts: what was counted against what the system said, posted at once ----------
++CREATE TABLE stock_counts (
++  id              TEXT PRIMARY KEY,
++  tenant_id       TEXT NOT NULL REFERENCES tenants(id),
++  number          TEXT NOT NULL,
++  location_id     TEXT NOT NULL,
++  note            TEXT,
++  created_by      TEXT,
++  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
++  idempotency_key TEXT NOT NULL,
++  UNIQUE (tenant_id, id),
++  UNIQUE (tenant_id, number),
++  UNIQUE (tenant_id, idempotency_key),
++  FOREIGN KEY (tenant_id, location_id) REFERENCES stock_locations(tenant_id, id)
++);
++CREATE TABLE stock_count_lines (
++  tenant_id  TEXT NOT NULL,
++  count_id   TEXT NOT NULL,
++  product_id TEXT NOT NULL,
++  expected   INTEGER NOT NULL,
++  counted    INTEGER NOT NULL CHECK (counted >= 0),
++  PRIMARY KEY (count_id, product_id),
++  FOREIGN KEY (tenant_id, count_id)   REFERENCES stock_counts(tenant_id, id),
++  FOREIGN KEY (tenant_id, product_id) REFERENCES products(tenant_id, id)
++);
++CREATE TRIGGER stock_counts_no_update BEFORE UPDATE ON stock_counts BEGIN SELECT RAISE(ABORT,'stock counts are append-only'); END;
++CREATE TRIGGER stock_counts_no_delete BEFORE DELETE ON stock_counts BEGIN SELECT RAISE(ABORT,'stock counts are append-only'); END;
++CREATE TRIGGER stock_count_lines_no_update BEFORE UPDATE ON stock_count_lines BEGIN SELECT RAISE(ABORT,'stock counts are append-only'); END;
++CREATE TRIGGER stock_count_lines_no_delete BEFORE DELETE ON stock_count_lines BEGIN SELECT RAISE(ABORT,'stock counts are append-only'); END;
++
++INSERT INTO schema_migrations (version, name) VALUES (6, 'products_and_inventory');
+diff --git a/apps/desktop/src-tauri/crates/db/src/brands.rs b/apps/desktop/src-tauri/crates/db/src/brands.rs
+new file mode 100644
+index 0000000..d7de11d
+--- /dev/null
++++ b/apps/desktop/src-tauri/crates/db/src/brands.rs
+@@ -0,0 +1,257 @@
++//! Companies and brands.
++//!
++//! A *company* is who makes or supplies the goods; a *brand* is what the product is sold as, and may belong to a
++//! company (a brand without a company is fine). Names are unique within a shop ignoring case. Both are renamed
++//! and deactivated, never deleted. A product can only be given an *active* company or brand, but products that
++//! already use one that was later deactivated keep it.
++
++use crate::master::{check_revision, clean, enqueue};
++use crate::users::{audit_entity, Principal, UserError};
++use crate::DbError;
++use rusqlite::{params, Connection, OptionalExtension, Row};
++use serde::Serialize;
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
++pub struct Company {
++    pub id: String,
++    pub name: String,
++    pub is_active: bool,
++    pub revision: i64,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
++pub struct Brand {
++    pub id: String,
++    pub name: String,
++    pub company_id: Option<String>,
++    pub is_active: bool,
++    pub revision: i64,
++}
++
++fn company_row(r: &Row) -> rusqlite::Result<Company> {
++    Ok(Company { id: r.get(0)?, name: r.get(1)?, is_active: r.get::<_, i64>(2)? == 1, revision: r.get(3)? })
++}
++fn brand_row(r: &Row) -> rusqlite::Result<Brand> {
++    Ok(Brand { id: r.get(0)?, name: r.get(1)?, company_id: r.get(2)?, is_active: r.get::<_, i64>(3)? == 1, revision: r.get(4)? })
++}
++fn snap<T: Serialize>(v: &T) -> serde_json::Value {
++    serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
++}
++
++pub fn list_companies(conn: &Connection, tenant: &str) -> Result<Vec<Company>, DbError> {
++    let mut st = conn.prepare("SELECT id,name,is_active,revision FROM companies WHERE tenant_id=?1 ORDER BY lower(name)")?;
++    let rows = st.query_map([tenant], company_row)?;
++    Ok(rows.collect::<Result<Vec<_>, _>>()?)
++}
++
++pub fn list_brands(conn: &Connection, tenant: &str) -> Result<Vec<Brand>, DbError> {
++    let mut st = conn.prepare("SELECT id,name,company_id,is_active,revision FROM brands WHERE tenant_id=?1 ORDER BY lower(name)")?;
++    let rows = st.query_map([tenant], brand_row)?;
++    Ok(rows.collect::<Result<Vec<_>, _>>()?)
++}
++
++pub fn get_company(c: &Connection, tenant: &str, id: &str) -> Result<Option<Company>, rusqlite::Error> {
++    c.query_row("SELECT id,name,is_active,revision FROM companies WHERE tenant_id=?1 AND id=?2", params![tenant, id], company_row).optional()
++}
++pub fn get_brand(c: &Connection, tenant: &str, id: &str) -> Result<Option<Brand>, rusqlite::Error> {
++    c.query_row("SELECT id,name,company_id,is_active,revision FROM brands WHERE tenant_id=?1 AND id=?2", params![tenant, id], brand_row).optional()
++}
++
++fn company_name_taken(c: &Connection, tenant: &str, name: &str, except: Option<&str>) -> Result<bool, rusqlite::Error> {
++    c.query_row("SELECT EXISTS(SELECT 1 FROM companies WHERE tenant_id=?1 AND lower(name)=lower(?2) AND id<>COALESCE(?3,''))", params![tenant, name, except], |r| r.get(0))
++}
++fn brand_name_taken(c: &Connection, tenant: &str, name: &str, except: Option<&str>) -> Result<bool, rusqlite::Error> {
++    c.query_row("SELECT EXISTS(SELECT 1 FROM brands WHERE tenant_id=?1 AND lower(name)=lower(?2) AND id<>COALESCE(?3,''))", params![tenant, name, except], |r| r.get(0))
++}
++
++pub fn create_company(conn: &mut Connection, tenant: &str, actor: &Principal, device: Option<&str>, name: &str, now: &str) -> Result<Company, UserError> {
++    let name = clean(name, 2, 60, "company name must be 2 to 60 characters")?;
++    let tx = conn.transaction()?;
++    if company_name_taken(&tx, tenant, &name, None)? {
++        return Err(UserError::Conflict("a company with that name already exists"));
++    }
++    let id = uuid::Uuid::new_v4().to_string();
++    tx.execute("INSERT INTO companies(id,tenant_id,name,created_at,updated_at) VALUES (?1,?2,?3,?4,?4)", params![id, tenant, name, now])?;
++    let co = get_company(&tx, tenant, &id)?.ok_or(UserError::NotFound)?;
++    audit_entity(&tx, tenant, Some(&actor.user_id), device, "company.create", "company", Some(&id), None, Some(&snap(&co).to_string()), now)?;
++    enqueue(&tx, tenant, "company", &id, "insert", &snap(&co), None, co.revision)?;
++    tx.commit()?;
++    Ok(co)
++}
++
++pub fn update_company(conn: &mut Connection, tenant: &str, actor: &Principal, device: Option<&str>, id: &str, expected_revision: i64, name: &str, now: &str) -> Result<Company, UserError> {
++    let name = clean(name, 2, 60, "company name must be 2 to 60 characters")?;
++    let tx = conn.transaction()?;
++    let before = get_company(&tx, tenant, id)?;
++    check_revision(before.as_ref().map(|c| c.revision), expected_revision)?;
++    let before = before.ok_or(UserError::NotFound)?;
++    if company_name_taken(&tx, tenant, &name, Some(id))? {
++        return Err(UserError::Conflict("a company with that name already exists"));
++    }
++    tx.execute("UPDATE companies SET name=?3, revision=revision+1, updated_at=?4 WHERE tenant_id=?1 AND id=?2", params![tenant, id, name, now])?;
++    let after = get_company(&tx, tenant, id)?.ok_or(UserError::NotFound)?;
++    audit_entity(&tx, tenant, Some(&actor.user_id), device, "company.update", "company", Some(id), Some(&snap(&before).to_string()), Some(&snap(&after).to_string()), now)?;
++    enqueue(&tx, tenant, "company", id, "update", &snap(&after), Some(before.revision), after.revision)?;
++    tx.commit()?;
++    Ok(after)
++}
++
++pub fn set_company_active(conn: &mut Connection, tenant: &str, actor: &Principal, device: Option<&str>, id: &str, expected_revision: i64, active: bool, now: &str) -> Result<Company, UserError> {
++    let tx = conn.transaction()?;
++    let before = get_company(&tx, tenant, id)?;
++    check_revision(before.as_ref().map(|c| c.revision), expected_revision)?;
++    let before = before.ok_or(UserError::NotFound)?;
++    if before.is_active == active {
++        return Ok(before);
++    }
++    tx.execute("UPDATE companies SET is_active=?3, revision=revision+1, updated_at=?4 WHERE tenant_id=?1 AND id=?2", params![tenant, id, active as i64, now])?;
++    let after = get_company(&tx, tenant, id)?.ok_or(UserError::NotFound)?;
++    let action = if active { "company.activate" } else { "company.deactivate" };
++    audit_entity(&tx, tenant, Some(&actor.user_id), device, action, "company", Some(id), Some(&snap(&before).to_string()), Some(&snap(&after).to_string()), now)?;
++    enqueue(&tx, tenant, "company", id, if active { "update" } else { "archive" }, &snap(&after), Some(before.revision), after.revision)?;
++    tx.commit()?;
++    Ok(after)
++}
++
++fn check_company_for_brand(tx: &Connection, tenant: &str, company: Option<&str>, current: Option<&str>) -> Result<(), UserError> {
++    let Some(c) = company else { return Ok(()) };
++    let co = get_company(tx, tenant, c)?;
++    match co {
++        None => Err(UserError::BadInput("unknown company")),
++        Some(co) if !co.is_active && Some(c) != current => Err(UserError::BadInput("that company is inactive")),
++        Some(_) => Ok(()),
++    }
++}
++
++fn clean_company_id(raw: Option<&str>) -> Option<String> {
++    raw.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
++}
++
++pub fn create_brand(conn: &mut Connection, tenant: &str, actor: &Principal, device: Option<&str>, name: &str, company_id: Option<&str>, now: &str) -> Result<Brand, UserError> {
++    let name = clean(name, 2, 60, "brand name must be 2 to 60 characters")?;
++    let company = clean_company_id(company_id);
++    let tx = conn.transaction()?;
++    if brand_name_taken(&tx, tenant, &name, None)? {
++        return Err(UserError::Conflict("a brand with that name already exists"));
++    }
++    check_company_for_brand(&tx, tenant, company.as_deref(), None)?;
++    let id = uuid::Uuid::new_v4().to_string();
++    tx.execute("INSERT INTO brands(id,tenant_id,name,company_id,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?5)", params![id, tenant, name, company, now])?;
++    let b = get_brand(&tx, tenant, &id)?.ok_or(UserError::NotFound)?;
++    audit_entity(&tx, tenant, Some(&actor.user_id), device, "brand.create", "brand", Some(&id), None, Some(&snap(&b).to_string()), now)?;
++    enqueue(&tx, tenant, "brand", &id, "insert", &snap(&b), None, b.revision)?;
++    tx.commit()?;
++    Ok(b)
++}
++
++pub fn update_brand(conn: &mut Connection, tenant: &str, actor: &Principal, device: Option<&str>, id: &str, expected_revision: i64, name: &str, company_id: Option<&str>, now: &str) -> Result<Brand, UserError> {
++    let name = clean(name, 2, 60, "brand name must be 2 to 60 characters")?;
++    let company = clean_company_id(company_id);
++    let tx = conn.transaction()?;
++    let before = get_brand(&tx, tenant, id)?;
++    check_revision(before.as_ref().map(|b| b.revision), expected_revision)?;
++    let before = before.ok_or(UserError::NotFound)?;
++    if brand_name_taken(&tx, tenant, &name, Some(id))? {
++        return Err(UserError::Conflict("a brand with that name already exists"));
++    }
++    check_company_for_brand(&tx, tenant, company.as_deref(), before.company_id.as_deref())?;
++    tx.execute("UPDATE brands SET name=?3, company_id=?4, revision=revision+1, updated_at=?5 WHERE tenant_id=?1 AND id=?2", params![tenant, id, name, company, now])?;
++    let after = get_brand(&tx, tenant, id)?.ok_or(UserError::NotFound)?;
++    audit_entity(&tx, tenant, Some(&actor.user_id), device, "brand.update", "brand", Some(id), Some(&snap(&before).to_string()), Some(&snap(&after).to_string()), now)?;
++    enqueue(&tx, tenant, "brand", id, "update", &snap(&after), Some(before.revision), after.revision)?;
++    tx.commit()?;
++    Ok(after)
++}
++
++pub fn set_brand_active(conn: &mut Connection, tenant: &str, actor: &Principal, device: Option<&str>, id: &str, expected_revision: i64, active: bool, now: &str) -> Result<Brand, UserError> {
++    let tx = conn.transaction()?;
++    let before = get_brand(&tx, tenant, id)?;
++    check_revision(before.as_ref().map(|b| b.revision), expected_revision)?;
++    let before = before.ok_or(UserError::NotFound)?;
++    if before.is_active == active {
++        return Ok(before);
++    }
++    tx.execute("UPDATE brands SET is_active=?3, revision=revision+1, updated_at=?4 WHERE tenant_id=?1 AND id=?2", params![tenant, id, active as i64, now])?;
++    let after = get_brand(&tx, tenant, id)?.ok_or(UserError::NotFound)?;
++    let action = if active { "brand.activate" } else { "brand.deactivate" };
++    audit_entity(&tx, tenant, Some(&actor.user_id), device, action, "brand", Some(id), Some(&snap(&before).to_string()), Some(&snap(&after).to_string()), now)?;
++    enqueue(&tx, tenant, "brand", id, if active { "update" } else { "archive" }, &snap(&after), Some(before.revision), after.revision)?;
++    tx.commit()?;
++    Ok(after)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::master::testutil::*;
++
++    fn mgr() -> Principal {
++        actor(&["products.manage"], &[])
++    }
++
++    #[test]
++    fn companies_are_created_renamed_and_unique_ignoring_case() {
++        let mut c = setup();
++        let a = create_company(&mut c, "t1", &mgr(), Some("d1"), "  Atlas Honda ", T0).unwrap();
++        assert_eq!((a.name.as_str(), a.revision, a.is_active), ("Atlas Honda", 1, true));
++        assert!(matches!(create_company(&mut c, "t1", &mgr(), None, "ATLAS HONDA", T0), Err(UserError::Conflict(_))));
++        assert!(matches!(create_company(&mut c, "t1", &mgr(), None, "x", T0), Err(UserError::BadInput(_))));
++        let b = create_company(&mut c, "t1", &mgr(), None, "Suzuki", T0).unwrap();
++        assert!(matches!(update_company(&mut c, "t1", &mgr(), None, &b.id, 1, "atlas honda", T0), Err(UserError::Conflict(_))));
++        let r = update_company(&mut c, "t1", &mgr(), None, &b.id, 1, "Pak Suzuki", T0).unwrap();
++        assert_eq!((r.name.as_str(), r.revision), ("Pak Suzuki", 2));
++        assert!(matches!(update_company(&mut c, "t1", &mgr(), None, &b.id, 1, "Again", T0), Err(UserError::Stale)));
++        assert!(matches!(update_company(&mut c, "t1", &mgr(), None, "ghost", 1, "Nobody", T0), Err(UserError::NotFound)));
++        let names: Vec<String> = list_companies(&c, "t1").unwrap().into_iter().map(|x| x.name).collect();
++        assert_eq!(names, ["Atlas Honda", "Pak Suzuki"]);
++    }
++
++    #[test]
++    fn brands_may_belong_to_an_active_company_or_to_none() {
++        let mut c = setup();
++        let co = create_company(&mut c, "t1", &mgr(), None, "Atlas Honda", T0).unwrap();
++        let b1 = create_brand(&mut c, "t1", &mgr(), None, "Honda Genuine", Some(&co.id), T0).unwrap();
++        assert_eq!(b1.company_id.as_deref(), Some(co.id.as_str()));
++        let b2 = create_brand(&mut c, "t1", &mgr(), None, "Local", None, T0).unwrap();
++        assert_eq!(b2.company_id, None);
++        let blank = create_brand(&mut c, "t1", &mgr(), None, "Blank company", Some("  "), T0).unwrap();
++        assert_eq!(blank.company_id, None, "a blank company means none");
++        assert!(matches!(create_brand(&mut c, "t1", &mgr(), None, "honda genuine", None, T0), Err(UserError::Conflict(_))));
++        assert!(matches!(create_brand(&mut c, "t1", &mgr(), None, "Ghost brand", Some("nope"), T0), Err(UserError::BadInput(_))));
++        set_company_active(&mut c, "t1", &mgr(), None, &co.id, 1, false, T0).unwrap();
++        assert!(matches!(create_brand(&mut c, "t1", &mgr(), None, "New under inactive", Some(&co.id), T0), Err(UserError::BadInput(_))));
++        // an existing brand keeps its (now inactive) company when it is renamed
++        let r = update_brand(&mut c, "t1", &mgr(), None, &b1.id, 1, "Honda Genuine Parts", Some(&co.id), T0).unwrap();
++        assert_eq!((r.name.as_str(), r.revision, r.company_id.as_deref()), ("Honda Genuine Parts", 2, Some(co.id.as_str())));
++        // but it cannot be moved onto an inactive company it was not already under
++        let other = create_company(&mut c, "t1", &mgr(), None, "Suzuki", T0).unwrap();
++        set_company_active(&mut c, "t1", &mgr(), None, &other.id, 1, false, T0).unwrap();
++        assert!(matches!(update_brand(&mut c, "t1", &mgr(), None, &b2.id, 1, "Local", Some(&other.id), T0), Err(UserError::BadInput(_))));
++    }
++
++    #[test]
++    fn revisions_activation_audit_and_outbox() {
++        let mut c = setup();
++        let b = create_brand(&mut c, "t1", &mgr(), Some("d1"), "Denso", None, T0).unwrap();
++        assert!(matches!(update_brand(&mut c, "t1", &mgr(), None, &b.id, 9, "Denso", None, T0), Err(UserError::Stale)));
++        let off = set_brand_active(&mut c, "t1", &mgr(), None, &b.id, 1, false, T0).unwrap();
++        assert_eq!((off.is_active, off.revision), (false, 2));
++        assert_eq!(set_brand_active(&mut c, "t1", &mgr(), None, &b.id, 2, false, T0).unwrap().revision, 2, "no-op");
++        assert!(set_brand_active(&mut c, "t1", &mgr(), None, &b.id, 2, true, T0).unwrap().is_active);
++        let ops: Vec<String> = outbox(&c).into_iter().map(|o| o.1).collect();
++        assert_eq!(ops, ["insert", "archive", "update"]);
++        let acts: Vec<String> = audit(&c).into_iter().map(|a| a.0).collect();
++        assert_eq!(acts, ["brand.create", "brand.deactivate", "brand.activate"]);
++    }
++
++    #[test]
++    fn other_shops_cannot_see_or_use_them() {
++        let mut c = setup();
++        c.execute("INSERT INTO tenants(id,name) VALUES ('t2','Other')", []).unwrap();
++        let mine = create_company(&mut c, "t1", &mgr(), None, "Mine", T0).unwrap();
++        create_company(&mut c, "t2", &mgr(), None, "Mine", T0).unwrap(); // same name in another shop is fine
++        assert_eq!(list_companies(&c, "t1").unwrap().len(), 1);
++        assert!(get_company(&c, "t2", &mine.id).unwrap().is_none());
++        assert!(matches!(create_brand(&mut c, "t2", &mgr(), None, "Theirs", Some(&mine.id), T0), Err(UserError::BadInput(_))));
++    }
++}
+diff --git a/apps/desktop/src-tauri/crates/db/src/catalog.rs b/apps/desktop/src-tauri/crates/db/src/catalog.rs
+index 42fa45b..c919776 100644
+--- a/apps/desktop/src-tauri/crates/db/src/catalog.rs
++++ b/apps/desktop/src-tauri/crates/db/src/catalog.rs
+@@ -1,12 +1,15 @@
+ //! Product categories and products.
+ //!
+-//! * SKUs are upper-case (`A-Z 0-9 . _ / -`, up to 40 characters) and unique per shop.
++//! * A product's code name (`sku`) is upper-case (`A-Z 0-9 . _ / -`, up to 40 characters) and unique per shop.
++//! * Each product has an English name, an optional Urdu name and model, an optional company and brand
++//!   (a brand that belongs to a company fills the company in), and an optional scheme (buy N, get M free).
+ //! * A barcode identifies exactly one product (unique index from migration 0005).
+ //! * Products and categories are deactivated or renamed, never deleted.
+ //! * Searching matches name, SKU (contains, ignoring case) or an exact barcode, so a scanner can be
+ //!   pointed straight at `search`.
+ //! * Prices are not here: they belong to the sales module's price lists (build step 5).
+ 
++use crate::brands;
+ use crate::master::{check_revision, clean, clean_opt, code, enqueue};
+ use crate::users::{audit_entity, Principal, UserError};
+ use crate::DbError;
+@@ -99,13 +102,21 @@ pub fn rename_category(
+ 
+ // ---------- products ----------
+ 
++/// A product. `sku` is its code name: the short unique code people type and scan. `name` is the English name.
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+ pub struct Product {
+     pub id: String,
+     pub sku: String,
+     pub name: String,
++    pub name_ur: Option<String>,
++    pub model: Option<String>,
+     pub barcode: Option<String>,
+     pub category_id: Option<String>,
++    pub company_id: Option<String>,
++    pub brand_id: Option<String>,
++    /// A scheme is "buy `scheme_buy`, get `scheme_free` free". Both are set or neither.
++    pub scheme_buy: Option<i64>,
++    pub scheme_free: Option<i64>,
+     pub unit: String,
+     pub is_active: bool,
+     pub revision: i64,
+@@ -115,24 +126,36 @@ pub struct Product {
+ pub struct ProductInput {
+     pub sku: String,
+     pub name: String,
++    pub name_ur: Option<String>,
++    pub model: Option<String>,
+     pub barcode: Option<String>,
+     pub category_id: Option<String>,
++    pub company_id: Option<String>,
++    pub brand_id: Option<String>,
++    pub scheme_buy: Option<i64>,
++    pub scheme_free: Option<i64>,
+     /// Lower-case word such as "pcs", "set", "litre". Blank means "pcs".
+     pub unit: String,
+ }
+ 
+-const PCOLS: &str = "id,sku,name,barcode,category_id,unit,is_active,revision";
++pub(crate) const PCOLS: &str = "p.id,p.sku,p.name,p.name_ur,p.model,p.barcode,p.category_id,p.company_id,p.brand_id,p.scheme_buy,p.scheme_free,p.unit,p.is_active,p.revision";
+ 
+-fn prod_from_row(r: &Row) -> rusqlite::Result<Product> {
++pub(crate) fn prod_from_row(r: &Row) -> rusqlite::Result<Product> {
+     Ok(Product {
+         id: r.get(0)?,
+         sku: r.get(1)?,
+         name: r.get(2)?,
+-        barcode: r.get(3)?,
+-        category_id: r.get(4)?,
+-        unit: r.get(5)?,
+-        is_active: r.get::<_, i64>(6)? == 1,
+-        revision: r.get(7)?,
++        name_ur: r.get(3)?,
++        model: r.get(4)?,
++        barcode: r.get(5)?,
++        category_id: r.get(6)?,
++        company_id: r.get(7)?,
++        brand_id: r.get(8)?,
++        scheme_buy: r.get(9)?,
++        scheme_free: r.get(10)?,
++        unit: r.get(11)?,
++        is_active: r.get::<_, i64>(12)? == 1,
++        revision: r.get(13)?,
+     })
+ }
+ 
+@@ -143,8 +166,13 @@ fn prod_json(p: &Product) -> serde_json::Value {
+ struct Clean {
+     sku: String,
+     name: String,
++    name_ur: Option<String>,
++    model: Option<String>,
+     barcode: Option<String>,
+     category: Option<String>,
++    company: Option<String>,
++    brand: Option<String>,
++    scheme: Option<(i64, i64)>,
+     unit: String,
+ }
+ 
+@@ -159,18 +187,30 @@ fn validate(i: &ProductInput) -> Result<Clean, UserError> {
+             return Err(UserError::BadInput("barcode must be 4 to 32 letters, digits or dashes"));
+         }
+     }
++    // Zero means "not set" (a blank number box), so 0/0 and blank/blank are both "no scheme".
++    let (buy, free) = (i.scheme_buy.filter(|n| *n != 0), i.scheme_free.filter(|n| *n != 0));
++    let scheme = match (buy, free) {
++        (None, None) => None,
++        (Some(b), Some(f)) if (1..=9999).contains(&b) && (1..=9999).contains(&f) => Some((b, f)),
++        _ => return Err(UserError::BadInput("a scheme needs both a buy quantity and a free quantity, each from 1 to 9999")),
++    };
+     Ok(Clean {
+-        sku: code(&i.sku, 1, 40, "._/-", "SKU must be 1 to 40 characters: A-Z, 0-9, dot, slash, dash, underscore")?,
+-        name: clean(&i.name, 2, 120, "name must be 2 to 120 characters")?,
++        sku: code(&i.sku, 1, 40, "._/-", "code name must be 1 to 40 characters: A-Z, 0-9, dot, slash, dash, underscore")?,
++        name: clean(&i.name, 2, 120, "English name must be 2 to 120 characters")?,
++        name_ur: clean_opt(i.name_ur.as_deref(), 120, "Urdu name is too long")?,
++        model: clean_opt(i.model.as_deref(), 60, "model is too long")?,
+         barcode,
+         category: clean_opt(i.category_id.as_deref(), 64, "invalid category")?,
++        company: clean_opt(i.company_id.as_deref(), 64, "invalid company")?,
++        brand: clean_opt(i.brand_id.as_deref(), 64, "invalid brand")?,
++        scheme,
+         unit,
+     })
+ }
+ 
+ pub fn get_product(conn: &Connection, tenant: &str, id: &str) -> Result<Option<Product>, DbError> {
+     Ok(conn
+-        .query_row(&format!("SELECT {PCOLS} FROM products WHERE tenant_id=?1 AND id=?2"), params![tenant, id], prod_from_row)
++        .query_row(&format!("SELECT {PCOLS} FROM products p WHERE p.tenant_id=?1 AND p.id=?2"), params![tenant, id], prod_from_row)
+         .optional()?)
+ }
+ 
+@@ -178,6 +218,8 @@ pub fn get_product(conn: &Connection, tenant: &str, id: &str) -> Result<Option<P
+ pub struct ProductQuery {
+     pub search: Option<String>,
+     pub category_id: Option<String>,
++    pub brand_id: Option<String>,
++    pub company_id: Option<String>,
+     pub include_inactive: bool,
+     pub limit: i64,
+     pub offset: i64,
+@@ -189,24 +231,31 @@ pub struct ProductPage {
+     pub total: i64,
+ }
+ 
+-const FILTER: &str = "tenant_id=?1
+-    AND (?2 IS NULL OR instr(lower(name),lower(?2))>0 OR instr(lower(sku),lower(?2))>0 OR barcode=?2)
+-    AND (?3 IS NULL OR category_id=?3)
+-    AND (?4=1 OR is_active=1)";
+-
+-/// Newest-name-first is not useful for a parts counter: results are ordered by name, then SKU.
++/// Text search covers the English and Urdu names, code name, model, brand, company and an exact barcode.
++pub(crate) const FROM: &str = "products p LEFT JOIN brands b ON b.id = p.brand_id LEFT JOIN companies c ON c.id = p.company_id";
++pub(crate) const FILTER: &str = "p.tenant_id=?1
++    AND (?2 IS NULL OR instr(lower(p.name),lower(?2))>0 OR instr(lower(p.sku),lower(?2))>0
++         OR instr(COALESCE(p.name_ur,''),?2)>0 OR instr(lower(COALESCE(p.model,'')),lower(?2))>0
++         OR instr(lower(COALESCE(b.name,'')),lower(?2))>0 OR instr(lower(COALESCE(c.name,'')),lower(?2))>0
++         OR p.barcode=?2)
++    AND (?3 IS NULL OR p.category_id=?3)
++    AND (?4 IS NULL OR p.brand_id=?4)
++    AND (?5 IS NULL OR p.company_id=?5)
++    AND (?6=1 OR p.is_active=1)";
++
++/// Results are ordered by English name, then code name.
+ pub fn search_products(conn: &Connection, tenant: &str, q: &ProductQuery) -> Result<ProductPage, DbError> {
+     let search = q.search.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(|s| s.chars().take(60).collect::<String>());
+     let limit = if q.limit <= 0 { 50 } else { q.limit.min(200) };
+     let offset = q.offset.max(0);
+     let inc = q.include_inactive as i64;
+     let total: i64 = conn.query_row(
+-        &format!("SELECT COUNT(*) FROM products WHERE {FILTER}"),
+-        params![tenant, search, q.category_id, inc],
++        &format!("SELECT COUNT(*) FROM {FROM} WHERE {FILTER}"),
++        params![tenant, search, q.category_id, q.brand_id, q.company_id, inc],
+         |r| r.get(0),
+     )?;
+-    let mut st = conn.prepare(&format!("SELECT {PCOLS} FROM products WHERE {FILTER} ORDER BY lower(name), sku LIMIT ?5 OFFSET ?6"))?;
+-    let rows = st.query_map(params![tenant, search, q.category_id, inc, limit, offset], prod_from_row)?;
++    let mut st = conn.prepare(&format!("SELECT {PCOLS} FROM {FROM} WHERE {FILTER} ORDER BY lower(p.name), p.sku LIMIT ?7 OFFSET ?8"))?;
++    let rows = st.query_map(params![tenant, search, q.category_id, q.brand_id, q.company_id, inc, limit, offset], prod_from_row)?;
+     Ok(ProductPage { items: rows.collect::<Result<Vec<_>, _>>()?, total })
+ }
+ 
+@@ -235,9 +284,34 @@ fn check_category(c: &Connection, tenant: &str, category: Option<&str>) -> Resul
+     Ok(())
+ }
+ 
++/// Company and brand must exist and be active (unless the product already uses an inactive one). A brand that
++/// belongs to a company fills in the product's company when it is blank, and may not be mixed with another company.
++/// Returns the (company, brand) to store.
++fn check_links(tx: &Connection, tenant: &str, v: &Clean, current: Option<&Product>) -> Result<(Option<String>, Option<String>), UserError> {
++    let mut company = v.company.clone();
++    if let Some(bid) = &v.brand {
++        let brand = brands::get_brand(tx, tenant, bid)?.ok_or(UserError::BadInput("unknown brand"))?;
++        if !brand.is_active && current.and_then(|p| p.brand_id.as_deref()) != Some(bid.as_str()) {
++            return Err(UserError::BadInput("that brand is inactive"));
++        }
++        match (&company, &brand.company_id) {
++            (None, Some(bc)) => company = Some(bc.clone()),
++            (Some(c), Some(bc)) if c != bc => return Err(UserError::BadInput("that brand belongs to a different company")),
++            _ => {}
++        }
++    }
++    if let Some(cid) = &company {
++        let co = brands::get_company(tx, tenant, cid)?.ok_or(UserError::BadInput("unknown company"))?;
++        if !co.is_active && current.and_then(|p| p.company_id.as_deref()) != Some(cid.as_str()) {
++            return Err(UserError::BadInput("that company is inactive"));
++        }
++    }
++    Ok((company, v.brand.clone()))
++}
++
+ fn check_unique(tx: &Connection, tenant: &str, v: &Clean, except: Option<&str>) -> Result<(), UserError> {
+     if sku_taken(tx, tenant, &v.sku, except)? {
+-        return Err(UserError::Conflict("a product with that SKU already exists"));
++        return Err(UserError::Conflict("a product with that code name already exists"));
+     }
+     if let Some(b) = &v.barcode {
+         if barcode_taken(tx, tenant, b, except)? {
+@@ -259,11 +333,13 @@ pub fn create_product(
+     let tx = conn.transaction()?;
+     check_unique(&tx, tenant, &v, None)?;
+     check_category(&tx, tenant, v.category.as_deref())?;
++    let (company, brand) = check_links(&tx, tenant, &v, None)?;
+     let id = uuid::Uuid::new_v4().to_string();
++    let (sb, sf) = v.scheme.map(|(b, f)| (Some(b), Some(f))).unwrap_or((None, None));
+     tx.execute(
+-        "INSERT INTO products(id,tenant_id,sku,name,barcode,category_id,unit,created_at,updated_at)
+-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8)",
+-        params![id, tenant, v.sku, v.name, v.barcode, v.category, v.unit, now],
++        "INSERT INTO products(id,tenant_id,sku,name,name_ur,model,barcode,category_id,company_id,brand_id,scheme_buy,scheme_free,unit,created_at,updated_at)
++         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14)",
++        params![id, tenant, v.sku, v.name, v.name_ur, v.model, v.barcode, v.category, company, brand, sb, sf, v.unit, now],
+     )?;
+     let p = get_product(&tx, tenant, &id).map_err(UserError::from)?.ok_or(UserError::NotFound)?;
+     let snap = prod_json(&p);
+@@ -290,10 +366,13 @@ pub fn update_product(
+     let before = before.ok_or(UserError::NotFound)?;
+     check_unique(&tx, tenant, &v, Some(id))?;
+     check_category(&tx, tenant, v.category.as_deref())?;
++    let (company, brand) = check_links(&tx, tenant, &v, Some(&before))?;
++    let (sb, sf) = v.scheme.map(|(b, f)| (Some(b), Some(f))).unwrap_or((None, None));
+     tx.execute(
+-        "UPDATE products SET sku=?3, name=?4, barcode=?5, category_id=?6, unit=?7, revision=revision+1, updated_at=?8
++        "UPDATE products SET sku=?3, name=?4, name_ur=?5, model=?6, barcode=?7, category_id=?8, company_id=?9, brand_id=?10,
++                scheme_buy=?11, scheme_free=?12, unit=?13, revision=revision+1, updated_at=?14
+          WHERE tenant_id=?1 AND id=?2",
+-        params![tenant, id, v.sku, v.name, v.barcode, v.category, v.unit, now],
++        params![tenant, id, v.sku, v.name, v.name_ur, v.model, v.barcode, v.category, company, brand, sb, sf, v.unit, now],
+     )?;
+     let after = get_product(&tx, tenant, id).map_err(UserError::from)?.ok_or(UserError::NotFound)?;
+     audit_entity(&tx, tenant, Some(&actor.user_id), device, "product.update", "product", Some(id), Some(&prod_json(&before).to_string()), Some(&prod_json(&after).to_string()), now)?;
+@@ -373,7 +452,7 @@ mod tests {
+         let cat = create_category(&mut c, "t1", &mgr(), None, "Brakes", T0).unwrap();
+         let p = create_product(
+             &mut c, "t1", &mgr(), Some("d1"),
+-            &ProductInput { sku: " bp-1234/a ".into(), name: " Brake pad front ".into(), barcode: Some(" 8901234567890 ".into()), category_id: Some(cat.id.clone()), unit: "set".into() },
++            &ProductInput { sku: " bp-1234/a ".into(), name: " Brake pad front ".into(), barcode: Some(" 8901234567890 ".into()), category_id: Some(cat.id.clone()), unit: "set".into(), ..Default::default() },
+             T0,
+         )
+         .unwrap();
+@@ -475,4 +554,136 @@ mod tests {
+         assert_eq!(search_products(&c, "t1", &ProductQuery::default()).unwrap().total, 1);
+         assert_eq!(search_products(&c, "t2", &ProductQuery::default()).unwrap().items[0].name, "Theirs");
+     }
++
++    // ---------- product details: Urdu name, model, company, brand, scheme ----------
++
++    fn urdu() -> String {
++        "بریک پیڈ فرنٹ".to_string()
++    }
++
++    fn full(sku: &str, name: &str) -> ProductInput {
++        ProductInput { sku: sku.into(), name: name.into(), ..Default::default() }
++    }
++
++    #[test]
++    fn a_product_keeps_its_urdu_name_model_company_brand_and_scheme() {
++        let mut c = setup();
++        let co = brands::create_company(&mut c, "t1", &mgr(), None, "Atlas Honda", T0).unwrap();
++        let br = brands::create_brand(&mut c, "t1", &mgr(), None, "Honda Genuine", Some(&co.id), T0).unwrap();
++        let p = create_product(
++            &mut c, "t1", &mgr(), None,
++            &ProductInput { name_ur: Some(format!("  {}  ", urdu())), model: Some(" CD 70 ".into()), company_id: Some(co.id.clone()), brand_id: Some(br.id.clone()), scheme_buy: Some(10), scheme_free: Some(1), ..full("bp-1", "Brake pad front") },
++            T0,
++        )
++        .unwrap();
++        assert_eq!(p.name_ur.as_deref(), Some(urdu().as_str()));
++        assert_eq!((p.model.as_deref(), p.company_id.as_deref(), p.brand_id.as_deref()), (Some("CD 70"), Some(co.id.as_str()), Some(br.id.as_str())));
++        assert_eq!((p.scheme_buy, p.scheme_free), (Some(10), Some(1)));
++        let again = get_product(&c, "t1", &p.id).unwrap().unwrap();
++        assert_eq!(again, p);
++        // blank optional text means "none"
++        let plain = create_product(&mut c, "t1", &mgr(), None, &ProductInput { name_ur: Some("  ".into()), model: Some("".into()), ..full("pl-1", "Plain part") }, T0).unwrap();
++        assert_eq!((plain.name_ur, plain.model, plain.scheme_buy, plain.scheme_free), (None, None, None, None));
++        let snap = outbox(&c).len();
++        assert!(snap >= 4, "company, brand and both products were queued");
++    }
++
++    #[test]
++    fn a_scheme_needs_both_numbers_or_neither() {
++        let mut c = setup();
++        let mk = |c: &mut Connection, b: Option<i64>, f: Option<i64>, sku: &str| create_product(c, "t1", &mgr(), None, &ProductInput { scheme_buy: b, scheme_free: f, ..full(sku, "Scheme part") }, T0);
++        assert!(mk(&mut c, Some(5), Some(1), "S1").is_ok());
++        assert!(mk(&mut c, None, None, "S2").is_ok());
++        let zeros = mk(&mut c, Some(0), Some(0), "S3").unwrap();
++        assert_eq!((zeros.scheme_buy, zeros.scheme_free), (None, None), "0 and 0 are blank number boxes, not a scheme");
++        for (b, f) in [(Some(5), None), (None, Some(1)), (Some(5), Some(0)), (Some(0), Some(1)), (Some(-1), Some(1)), (Some(10000), Some(1)), (Some(5), Some(10000))] {
++            assert!(matches!(mk(&mut c, b, f, "S9"), Err(UserError::BadInput(_))), "{b:?}/{f:?}");
++        }
++    }
++
++    #[test]
++    fn the_database_itself_refuses_half_a_scheme() {
++        let mut c = setup();
++        let p = add(&mut c, "SCH-1", "Scheme part");
++        assert!(c.execute("UPDATE products SET scheme_buy=5 WHERE id=?1", [&p.id]).is_err(), "buy without free");
++        assert!(c.execute("UPDATE products SET scheme_free=1 WHERE id=?1", [&p.id]).is_err(), "free without buy");
++        assert!(c.execute("UPDATE products SET scheme_buy=5, scheme_free=1 WHERE id=?1", [&p.id]).is_ok());
++        assert!(c.execute("UPDATE products SET scheme_buy=0, scheme_free=1 WHERE id=?1", [&p.id]).is_err());
++    }
++
++    #[test]
++    fn a_brand_that_belongs_to_a_company_fills_the_company_in_and_cannot_be_mixed() {
++        let mut c = setup();
++        let honda = brands::create_company(&mut c, "t1", &mgr(), None, "Atlas Honda", T0).unwrap();
++        let suzuki = brands::create_company(&mut c, "t1", &mgr(), None, "Pak Suzuki", T0).unwrap();
++        let genuine = brands::create_brand(&mut c, "t1", &mgr(), None, "Honda Genuine", Some(&honda.id), T0).unwrap();
++        let local = brands::create_brand(&mut c, "t1", &mgr(), None, "Local", None, T0).unwrap();
++        let p = create_product(&mut c, "t1", &mgr(), None, &ProductInput { brand_id: Some(genuine.id.clone()), ..full("A1", "Filled in") }, T0).unwrap();
++        assert_eq!(p.company_id.as_deref(), Some(honda.id.as_str()), "company comes from the brand");
++        let clash = create_product(&mut c, "t1", &mgr(), None, &ProductInput { brand_id: Some(genuine.id.clone()), company_id: Some(suzuki.id.clone()), ..full("A2", "Mixed") }, T0);
++        assert!(matches!(clash, Err(UserError::BadInput(_))));
++        // a brand with no company goes with any company
++        let ok = create_product(&mut c, "t1", &mgr(), None, &ProductInput { brand_id: Some(local.id.clone()), company_id: Some(suzuki.id.clone()), ..full("A3", "Free mix") }, T0).unwrap();
++        assert_eq!((ok.brand_id.as_deref(), ok.company_id.as_deref()), (Some(local.id.as_str()), Some(suzuki.id.as_str())));
++        // company alone is fine
++        assert!(create_product(&mut c, "t1", &mgr(), None, &ProductInput { company_id: Some(honda.id.clone()), ..full("A4", "Company only") }, T0).is_ok());
++        for bad in [ProductInput { brand_id: Some("nope".into()), ..full("B1", "Ghost brand") }, ProductInput { company_id: Some("nope".into()), ..full("B2", "Ghost company") }] {
++            assert!(matches!(create_product(&mut c, "t1", &mgr(), None, &bad, T0), Err(UserError::BadInput(_))));
++        }
++    }
++
++    #[test]
++    fn inactive_brands_and_companies_cannot_be_newly_chosen_but_existing_products_keep_them() {
++        let mut c = setup();
++        let br = brands::create_brand(&mut c, "t1", &mgr(), None, "Old Brand", None, T0).unwrap();
++        let p = create_product(&mut c, "t1", &mgr(), None, &ProductInput { brand_id: Some(br.id.clone()), ..full("O1", "Uses old brand") }, T0).unwrap();
++        brands::set_brand_active(&mut c, "t1", &mgr(), None, &br.id, 1, false, T0).unwrap();
++        let blocked = create_product(&mut c, "t1", &mgr(), None, &ProductInput { brand_id: Some(br.id.clone()), ..full("O2", "New with old brand") }, T0);
++        assert!(matches!(blocked, Err(UserError::BadInput(_))));
++        let kept = update_product(&mut c, "t1", &mgr(), None, &p.id, 1, &ProductInput { brand_id: Some(br.id.clone()), model: Some("CG 125".into()), ..full("O1", "Uses old brand") }, T0).unwrap();
++        assert_eq!((kept.brand_id.as_deref(), kept.model.as_deref()), (Some(br.id.as_str()), Some("CG 125")));
++        let dropped = update_product(&mut c, "t1", &mgr(), None, &p.id, 2, &full("O1", "Uses old brand"), T0).unwrap();
++        assert_eq!(dropped.brand_id, None, "clearing it is always allowed");
++    }
++
++    #[test]
++    fn another_shops_brand_or_company_is_unknown_and_the_database_agrees() {
++        let mut c = setup();
++        c.execute("INSERT INTO tenants(id,name) VALUES ('t2','Other')", []).unwrap();
++        let theirs = brands::create_brand(&mut c, "t2", &mgr(), None, "Theirs", None, T0).unwrap();
++        let their_co = brands::create_company(&mut c, "t2", &mgr(), None, "Their Co", T0).unwrap();
++        assert!(matches!(create_product(&mut c, "t1", &mgr(), None, &ProductInput { brand_id: Some(theirs.id.clone()), ..full("X1", "Cross brand") }, T0), Err(UserError::BadInput(_))));
++        assert!(matches!(create_product(&mut c, "t1", &mgr(), None, &ProductInput { company_id: Some(their_co.id.clone()), ..full("X2", "Cross company") }, T0), Err(UserError::BadInput(_))));
++        // even raw SQL cannot link across shops
++        let raw = |col: &str, id: &str| c.execute(&format!("INSERT INTO products(id,tenant_id,sku,name,{col}) VALUES ('rawp','t1','RAW','Raw product',?1)"), [id]);
++        assert!(raw("brand_id", &theirs.id).is_err());
++        assert!(raw("company_id", &their_co.id).is_err());
++    }
++
++    #[test]
++    fn search_finds_products_by_urdu_name_model_brand_and_company() {
++        let mut c = setup();
++        let honda = brands::create_company(&mut c, "t1", &mgr(), None, "Atlas Honda", T0).unwrap();
++        let suzuki = brands::create_company(&mut c, "t1", &mgr(), None, "Pak Suzuki", T0).unwrap();
++        let genuine = brands::create_brand(&mut c, "t1", &mgr(), None, "Honda Genuine", Some(&honda.id), T0).unwrap();
++        let mk = |c: &mut Connection, i: ProductInput| create_product(c, "t1", &mgr(), None, &i, T0).unwrap();
++        mk(&mut c, ProductInput { name_ur: Some(urdu()), model: Some("CD 70".into()), brand_id: Some(genuine.id.clone()), ..full("P1", "Brake pad front") });
++        mk(&mut c, ProductInput { model: Some("GS 150".into()), company_id: Some(suzuki.id.clone()), ..full("P2", "Clutch plate") });
++        mk(&mut c, full("P3", "Spark plug"));
++        let s = |c: &Connection, t: &str| search_products(c, "t1", &ProductQuery { search: Some(t.into()), ..Default::default() }).unwrap();
++        assert_eq!(s(&c, "پیڈ").items[0].sku, "P1", "Urdu name");
++        assert_eq!(s(&c, "cd 70").items[0].sku, "P1", "model, ignoring case");
++        assert_eq!(s(&c, "genuine").total, 1, "brand name");
++        assert_eq!(s(&c, "suzuki").items[0].sku, "P2", "company name");
++        assert_eq!(s(&c, "atlas").items[0].sku, "P1", "the company a brand brought along");
++        assert_eq!(s(&c, "spark").total, 1);
++        let by = |c: &Connection, brand: Option<&str>, company: Option<&str>| {
++            search_products(c, "t1", &ProductQuery { brand_id: brand.map(Into::into), company_id: company.map(Into::into), ..Default::default() }).unwrap().total
++        };
++        assert_eq!(by(&c, Some(&genuine.id), None), 1);
++        assert_eq!(by(&c, None, Some(&honda.id)), 1);
++        assert_eq!(by(&c, None, Some(&suzuki.id)), 1);
++        assert_eq!(by(&c, Some(&genuine.id), Some(&suzuki.id)), 0, "filters combine");
++        assert_eq!(by(&c, None, None), 3);
++    }
+ }
+diff --git a/apps/desktop/src-tauri/crates/db/src/inventory.rs b/apps/desktop/src-tauri/crates/db/src/inventory.rs
+new file mode 100644
+index 0000000..1d04b2f
+--- /dev/null
++++ b/apps/desktop/src-tauri/crates/db/src/inventory.rs
+@@ -0,0 +1,626 @@
++//! Stock levels, restocking, adjustments, reorder levels and movement history.
++//!
++//! Every change goes through the append-only ledger (`stock::post_all`); the tables here (`stock_operations`) only
++//! record WHY stock moved: who, where, how many and the reason. Each operation carries a client-made
++//! `idempotency_key`: sending the same request again (a retry after a lost answer) returns the first result and
++//! posts nothing twice. Reusing a key for a different request is refused.
++//!
++//! What a person may see is limited to the locations they can use: with `locations.all` that is every location,
++//! otherwise only the ones assigned to them (the totals add up only what they can see).
++
++use crate::catalog::{self, Product};
++use crate::master::{clean, clean_opt, enqueue};
++use crate::stock::{self, clean_key, guard_location, post_all, require_location, require_product, Planned, MAX_QTY};
++use crate::users::{audit_entity, AccessContext, Principal, UserError};
++use rusqlite::{params, Connection, OptionalExtension, Row};
++use serde::Serialize;
++use std::collections::BTreeMap;
++
++// ---------- operations: restock and adjustments ----------
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
++pub struct StockOperation {
++    pub id: String,
++    pub kind: String,
++    pub location_id: String,
++    pub product_id: String,
++    pub qty: i64,
++    pub note: Option<String>,
++    pub reference: Option<String>,
++    pub actor_id: Option<String>,
++    pub created_at: String,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
++pub struct OpOutcome {
++    pub operation: StockOperation,
++    /// True when this request had been made before (same idempotency key): nothing new was posted.
++    pub duplicate: bool,
++}
++
++fn op_row(r: &Row) -> rusqlite::Result<StockOperation> {
++    Ok(StockOperation { id: r.get(0)?, kind: r.get(1)?, location_id: r.get(2)?, product_id: r.get(3)?, qty: r.get(4)?, note: r.get(5)?, reference: r.get(6)?, actor_id: r.get(7)?, created_at: r.get(8)? })
++}
++
++const OP_COLS: &str = "id,kind,location_id,product_id,qty,note,reference,actor_id,created_at";
++
++fn find_operation(c: &Connection, tenant: &str, key: &str) -> Result<Option<StockOperation>, rusqlite::Error> {
++    c.query_row(&format!("SELECT {OP_COLS} FROM stock_operations WHERE tenant_id=?1 AND idempotency_key=?2"), params![tenant, key], op_row).optional()
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum AdjustKind {
++    /// Signed quantity: + stock found, - stock lost.
++    Correction,
++    /// Good stock becomes damaged stock.
++    Damage,
++    /// Damaged stock is thrown away.
++    WriteOff,
++}
++
++impl AdjustKind {
++    fn name(self) -> &'static str {
++        match self {
++            AdjustKind::Correction => "correction",
++            AdjustKind::Damage => "damage",
++            AdjustKind::WriteOff => "write_off",
++        }
++    }
++}
++
++struct OpRequest<'a> {
++    kind: &'static str,
++    location_id: &'a str,
++    product_id: &'a str,
++    qty: i64,
++    note: Option<String>,
++    reference: Option<String>,
++    key: &'a str,
++    product_must_be_active: bool,
++}
++
++fn run_operation(
++    conn: &mut Connection,
++    tenant: &str,
++    actor: &Principal,
++    device: Option<&str>,
++    req: OpRequest,
++    plan: impl Fn(&str) -> Result<Vec<Planned>, UserError>,
++    now: &str,
++) -> Result<OpOutcome, UserError> {
++    let key = clean_key(req.key)?;
++    guard_location(actor, req.location_id)?;
++    let tx = conn.transaction()?;
++    if let Some(prev) = find_operation(&tx, tenant, &key)? {
++        let same = prev.kind == req.kind && prev.location_id == req.location_id && prev.product_id == req.product_id && prev.qty == req.qty;
++        return if same { Ok(OpOutcome { operation: prev, duplicate: true }) } else { Err(UserError::Conflict("that idempotency key was already used for a different request")) };
++    }
++    require_location(&tx, tenant, req.location_id)?;
++    require_product(&tx, tenant, req.product_id, req.product_must_be_active)?;
++    let planned = plan(&key)?;
++    let id = uuid::Uuid::new_v4().to_string();
++    tx.execute(
++        "INSERT INTO stock_operations(id,tenant_id,kind,location_id,product_id,qty,note,reference,actor_id,device_id,idempotency_key,created_at)
++         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
++        params![id, tenant, req.kind, req.location_id, req.product_id, req.qty, req.note, req.reference, actor.user_id, device, key, now],
++    )?;
++    post_all(&tx, tenant, actor, device, req.kind, &id, &planned, now)?;
++    let op = tx.query_row(&format!("SELECT {OP_COLS} FROM stock_operations WHERE id=?1"), [&id], op_row)?;
++    let snap = serde_json::to_value(&op).unwrap_or(serde_json::Value::Null);
++    audit_entity(&tx, tenant, Some(&actor.user_id), device, &format!("stock.{}", req.kind), "stock_operation", Some(&id), None, Some(&snap.to_string()), now)?;
++    enqueue(&tx, tenant, "stock_operation", &id, "insert", &snap, None, 1)?;
++    tx.commit()?;
++    Ok(OpOutcome { operation: op, duplicate: false })
++}
++
++pub struct ReceiveRequest<'a> {
++    pub location_id: &'a str,
++    pub product_id: &'a str,
++    pub qty: i64,
++    pub note: Option<&'a str>,
++    /// For example the supplier's bill number.
++    pub reference: Option<&'a str>,
++}
++
++/// Stock arrives at a location (a purchase or an opening balance).
++pub fn receive_stock(conn: &mut Connection, tenant: &str, actor: &Principal, device: Option<&str>, r: &ReceiveRequest, key: &str, now: &str) -> Result<OpOutcome, UserError> {
++    let note = clean_opt(r.note, 200, "note is too long")?;
++    let reference = clean_opt(r.reference, 60, "reference is too long")?;
++    run_operation(
++        conn, tenant, actor, device,
++        OpRequest { kind: "receive", location_id: r.location_id, product_id: r.product_id, qty: r.qty, note, reference, key, product_must_be_active: true },
++        |k| stock::plan_receive(r.location_id, r.product_id, r.qty, k),
++        now,
++    )
++}
++
++pub struct AdjustRequest<'a> {
++    pub kind: AdjustKind,
++    pub location_id: &'a str,
++    pub product_id: &'a str,
++    pub qty: i64,
++    /// Why. Required: every adjustment has a reason on record.
++    pub reason: &'a str,
++}
++
++pub fn adjust_stock(conn: &mut Connection, tenant: &str, actor: &Principal, device: Option<&str>, r: &AdjustRequest, key: &str, now: &str) -> Result<OpOutcome, UserError> {
++    let reason = clean(r.reason, 3, 200, "give a reason of 3 to 200 characters")?;
++    let kind = r.kind.name();
++    run_operation(
++        conn, tenant, actor, device,
++        OpRequest { kind, location_id: r.location_id, product_id: r.product_id, qty: r.qty, note: Some(reason), reference: None, key, product_must_be_active: false },
++        |k| match r.kind {
++            AdjustKind::Correction => stock::plan_correct(r.location_id, r.product_id, r.qty, k),
++            AdjustKind::Damage => stock::plan_damage(r.location_id, r.product_id, r.qty, k),
++            AdjustKind::WriteOff => stock::plan_write_off(r.location_id, r.product_id, r.qty, k),
++        },
++        now,
++    )
++}
++
++/// Set (or with `None` clear) the level at which a product counts as low at a location.
++pub fn set_reorder_level(conn: &mut Connection, tenant: &str, actor: &Principal, device: Option<&str>, location_id: &str, product_id: &str, level: Option<i64>, now: &str) -> Result<(), UserError> {
++    if let Some(l) = level {
++        if !(0..=MAX_QTY).contains(&l) {
++            return Err(UserError::BadInput("reorder level must be a whole number from 0 to 1,000,000"));
++        }
++    }
++    guard_location(actor, location_id)?;
++    let tx = conn.transaction()?;
++    require_location(&tx, tenant, location_id)?;
++    require_product(&tx, tenant, product_id, false)?;
++    let before: Option<i64> = tx
++        .query_row("SELECT reorder_level FROM inventory_balances WHERE tenant_id=?1 AND location_id=?2 AND product_id=?3", params![tenant, location_id, product_id], |r| r.get(0))
++        .optional()?
++        .flatten();
++    tx.execute(
++        "INSERT INTO inventory_balances(tenant_id,location_id,product_id,reorder_level) VALUES (?1,?2,?3,?4)
++         ON CONFLICT(location_id,product_id) DO UPDATE SET reorder_level=excluded.reorder_level",
++        params![tenant, location_id, product_id, level],
++    )?;
++    let entity_id = format!("{location_id}:{product_id}");
++    let (b, a) = (serde_json::json!({ "reorder_level": before }).to_string(), serde_json::json!({ "reorder_level": level }).to_string());
++    audit_entity(&tx, tenant, Some(&actor.user_id), device, "stock.reorder_level", "stock_level", Some(&entity_id), Some(&b), Some(&a), now)?;
++    tx.commit()?;
++    Ok(())
++}
++
++// ---------- stock levels ----------
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
++pub struct LocationQty {
++    pub location_id: String,
++    pub on_hand: i64,
++    pub damaged: i64,
++    pub in_transit: i64,
++    pub reorder_level: Option<i64>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
++pub struct StockItem {
++    pub product: Product,
++    /// Only locations where something is recorded; a missing location means zero.
++    pub by_location: Vec<LocationQty>,
++    pub total_on_hand: i64,
++    pub total_damaged: i64,
++    pub total_in_transit: i64,
++    /// True when some location is at or below its reorder level.
++    pub low: bool,
++}
++
++#[derive(Debug, Clone, Serialize)]
++pub struct StockPage {
++    pub items: Vec<StockItem>,
++    pub total: i64,
++}
++
++#[derive(Debug, Clone, Default)]
++pub struct StockQuery {
++    pub search: Option<String>,
++    pub category_id: Option<String>,
++    pub brand_id: Option<String>,
++    pub company_id: Option<String>,
++    /// Show only this location's quantities.
++    pub location_id: Option<String>,
++    pub low_only: bool,
++    pub limit: i64,
++    pub offset: i64,
++}
++
++/// `None` means every location; `Some(json array)` is the list the person may see.
++fn visible_json(access: &AccessContext) -> Option<String> {
++    if access.all_locations {
++        None
++    } else {
++        Some(serde_json::to_string(&access.location_ids).unwrap_or_else(|_| "[]".into()))
++    }
++}
++
++/// Products that match the search and the filters, with their quantities at the locations the caller may see.
++/// Active products are listed; an inactive product is listed only while it still holds stock.
++pub fn stock_levels(conn: &Connection, tenant: &str, access: &AccessContext, q: &StockQuery) -> Result<StockPage, UserError> {
++    if let Some(l) = &q.location_id {
++        if !access.all_locations && !access.location_ids.contains(l) {
++            return Err(UserError::Forbidden("location_denied"));
++        }
++    }
++    let visible = visible_json(access);
++    let search = q.search.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(|s| s.chars().take(60).collect::<String>());
++    let limit = if q.limit <= 0 { 50 } else { q.limit.min(200) };
++    let offset = q.offset.max(0);
++    let stock_filter = catalog::FILTER.replace(
++        "(?6=1 OR p.is_active=1)",
++        "(p.is_active=1 OR EXISTS (SELECT 1 FROM inventory_balances z WHERE z.tenant_id=p.tenant_id AND z.product_id=p.id AND (z.on_hand<>0 OR z.damaged<>0 OR z.in_transit<>0)))",
++    );
++    let low_clause = "AND (?9=0 OR EXISTS (SELECT 1 FROM inventory_balances ib WHERE ib.tenant_id=p.tenant_id AND ib.product_id=p.id
++                       AND ib.reorder_level IS NOT NULL AND ib.on_hand <= ib.reorder_level
++                       AND (?10 IS NULL OR ib.location_id IN (SELECT value FROM json_each(?10))) AND (?11 IS NULL OR ib.location_id=?11)))";
++    let where_sql = format!("{stock_filter} {low_clause}");
++    let args = params![tenant, search, q.category_id, q.brand_id, q.company_id, 0, limit, offset, q.low_only as i64, visible, q.location_id];
++    let total: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {} WHERE {where_sql}", catalog::FROM), args, |r| r.get(0))?;
++    let mut st = conn.prepare(&format!("SELECT {} FROM {} WHERE {where_sql} ORDER BY lower(p.name), p.sku LIMIT ?7 OFFSET ?8", catalog::PCOLS, catalog::FROM))?;
++    let products: Vec<Product> = st.query_map(args, catalog::prod_from_row)?.collect::<Result<_, _>>()?;
++
++    let ids = serde_json::to_string(&products.iter().map(|p| p.id.clone()).collect::<Vec<_>>()).unwrap_or_else(|_| "[]".into());
++    let mut by: BTreeMap<String, Vec<LocationQty>> = BTreeMap::new();
++    let mut st = conn.prepare(
++        "SELECT product_id, location_id, on_hand, damaged, in_transit, reorder_level FROM inventory_balances
++         WHERE tenant_id=?1 AND product_id IN (SELECT value FROM json_each(?2))
++           AND (?3 IS NULL OR location_id IN (SELECT value FROM json_each(?3))) AND (?4 IS NULL OR location_id=?4)
++           AND (on_hand<>0 OR damaged<>0 OR in_transit<>0 OR reorder_level IS NOT NULL)
++         ORDER BY location_id",
++    )?;
++    let rows = st.query_map(params![tenant, ids, visible, q.location_id], |r| {
++        Ok((r.get::<_, String>(0)?, LocationQty { location_id: r.get(1)?, on_hand: r.get(2)?, damaged: r.get(3)?, in_transit: r.get(4)?, reorder_level: r.get(5)? }))
++    })?;
++    for row in rows {
++        let (p, l) = row?;
++        by.entry(p).or_default().push(l);
++    }
++    let items = products
++        .into_iter()
++        .map(|product| {
++            let by_location = by.remove(&product.id).unwrap_or_default();
++            StockItem {
++                total_on_hand: by_location.iter().map(|l| l.on_hand).sum(),
++                total_damaged: by_location.iter().map(|l| l.damaged).sum(),
++                total_in_transit: by_location.iter().map(|l| l.in_transit).sum(),
++                low: by_location.iter().any(|l| l.reorder_level.is_some_and(|lv| l.on_hand <= lv)),
++                by_location,
++                product,
++            }
++        })
++        .collect();
++    Ok(StockPage { items, total })
++}
++
++// ---------- movement history ----------
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
++pub struct MovementRow {
++    pub id: String,
++    pub location_id: String,
++    pub product_id: String,
++    pub bucket: String,
++    pub qty_delta: i64,
++    pub movement_type: String,
++    pub source_type: String,
++    pub source_id: String,
++    pub actor_name: Option<String>,
++    pub occurred_at: String,
++}
++
++#[derive(Debug, Clone, Serialize)]
++pub struct MovementPage {
++    pub items: Vec<MovementRow>,
++    pub total: i64,
++}
++
++#[derive(Debug, Clone, Default)]
++pub struct MovementQuery {
++    pub product_id: Option<String>,
++    pub location_id: Option<String>,
++    pub limit: i64,
++    pub offset: i64,
++}
++
++/// Newest first, limited to the locations the caller may see.
++pub fn movements(conn: &Connection, tenant: &str, access: &AccessContext, q: &MovementQuery) -> Result<MovementPage, UserError> {
++    if let Some(l) = &q.location_id {
++        if !access.all_locations && !access.location_ids.contains(l) {
++            return Err(UserError::Forbidden("location_denied"));
++        }
++    }
++    let visible = visible_json(access);
++    let limit = if q.limit <= 0 { 50 } else { q.limit.min(200) };
++    let filter = "m.tenant_id=?1 AND (?2 IS NULL OR m.product_id=?2) AND (?3 IS NULL OR m.location_id=?3)
++                  AND (?4 IS NULL OR m.location_id IN (SELECT value FROM json_each(?4)))";
++    let total: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM stock_movements m WHERE {filter}"), params![tenant, q.product_id, q.location_id, visible], |r| r.get(0))?;
++    let mut st = conn.prepare(&format!(
++        "SELECT m.id, m.location_id, m.product_id, m.bucket, m.qty_delta, m.movement_type, m.source_type, m.source_id, u.full_name, m.occurred_at
++         FROM stock_movements m LEFT JOIN users u ON u.tenant_id=m.tenant_id AND u.id=m.actor_id
++         WHERE {filter} ORDER BY m.occurred_at DESC, m.rowid DESC LIMIT ?5 OFFSET ?6"
++    ))?;
++    let rows = st.query_map(params![tenant, q.product_id, q.location_id, visible, limit, q.offset.max(0)], |r| {
++        Ok(MovementRow { id: r.get(0)?, location_id: r.get(1)?, product_id: r.get(2)?, bucket: r.get(3)?, qty_delta: r.get(4)?, movement_type: r.get(5)?, source_type: r.get(6)?, source_id: r.get(7)?, actor_name: r.get(8)?, occurred_at: r.get(9)? })
++    })?;
++    Ok(MovementPage { items: rows.collect::<Result<_, _>>()?, total })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::brands;
++    use crate::catalog::{create_product, set_product_active, ProductInput};
++    use crate::master::testutil::*;
++    use crate::stock::{bucket_balance, ON_HAND};
++
++    const OWNER: &[&str] = &["*"];
++
++    /// Locations main/g1/g2 and products p1..p3 (ids are the codes in lower case).
++    fn shop() -> Connection {
++        let c = setup();
++        c.execute_batch(
++            "INSERT INTO stock_locations(id,tenant_id,name,code) VALUES ('main','t1','Main Shop','MAIN'),('g1','t1','Godown 1','G1'),('g2','t1','Godown 2','G2');
++             INSERT INTO products(id,tenant_id,sku,name) VALUES ('p1','t1','BP-100','Brake pad'),('p2','t1','OF-10','Oil filter'),('p3','t1','SP-01','Spark plug');",
++        )
++        .unwrap();
++        c
++    }
++
++    fn me() -> Principal {
++        actor(OWNER, &[])
++    }
++
++    fn recv(c: &mut Connection, loc: &str, prod: &str, qty: i64, key: &str) -> Result<OpOutcome, UserError> {
++        receive_stock(c, "t1", &me(), Some("d1"), &ReceiveRequest { location_id: loc, product_id: prod, qty, note: None, reference: None }, key, T0)
++    }
++
++    fn adj(c: &mut Connection, kind: AdjustKind, loc: &str, prod: &str, qty: i64, key: &str) -> Result<OpOutcome, UserError> {
++        adjust_stock(c, "t1", &me(), Some("d1"), &AdjustRequest { kind, location_id: loc, product_id: prod, qty, reason: "stock check" }, key, T0)
++    }
++
++    fn bal(c: &Connection, loc: &str, prod: &str, b: &str) -> i64 {
++        bucket_balance(c, "t1", loc, prod, b).unwrap()
++    }
++
++    fn n(c: &Connection, table: &str) -> i64 {
++        c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap()
++    }
++
++    #[test]
++    fn restocking_adds_stock_and_records_who_where_and_how_many() {
++        let mut c = shop();
++        let out = receive_stock(&mut c, "t1", &me(), Some("d1"), &ReceiveRequest { location_id: "g1", product_id: "p1", qty: 12, note: Some(" first delivery "), reference: Some("BILL-77") }, "key-restock-1", T0).unwrap();
++        assert!(!out.duplicate);
++        assert_eq!((out.operation.kind.as_str(), out.operation.qty, out.operation.note.as_deref(), out.operation.reference.as_deref()), ("receive", 12, Some("first delivery"), Some("BILL-77")));
++        assert_eq!(bal(&c, "g1", "p1", ON_HAND), 12);
++        let (ty, src_type, src_id): (String, String, String) =
++            c.query_row("SELECT movement_type, source_type, source_id FROM stock_movements", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
++        assert_eq!((ty.as_str(), src_type.as_str(), src_id.as_str()), ("purchase", "receive", out.operation.id.as_str()));
++        assert!(audit(&c).iter().any(|a| a.0 == "stock.receive"));
++        let ob = outbox(&c);
++        assert!(ob.iter().any(|o| o.0 == "stock_movement" && o.1 == "post") && ob.iter().any(|o| o.0 == "stock_operation" && o.1 == "insert"));
++    }
++
++    #[test]
++    fn a_retry_with_the_same_key_posts_nothing_twice_and_a_clashing_key_is_refused() {
++        let mut c = shop();
++        let first = recv(&mut c, "g1", "p1", 5, "key-retry-001").unwrap();
++        let again = recv(&mut c, "g1", "p1", 5, "key-retry-001").unwrap();
++        assert!(again.duplicate);
++        assert_eq!(again.operation, first.operation);
++        assert_eq!(bal(&c, "g1", "p1", ON_HAND), 5, "stock was added once");
++        assert_eq!(n(&c, "stock_movements"), 1);
++        assert_eq!(n(&c, "stock_operations"), 1);
++        // the same key for a different request is a mistake, not a retry
++        assert!(matches!(recv(&mut c, "g1", "p1", 6, "key-retry-001"), Err(UserError::Conflict(_))));
++        assert!(matches!(recv(&mut c, "g2", "p1", 5, "key-retry-001"), Err(UserError::Conflict(_))));
++        assert!(matches!(adj(&mut c, AdjustKind::Correction, "g1", "p1", 5, "key-retry-001"), Err(UserError::Conflict(_))));
++        for bad in ["short", "has spaces in it", ""] {
++            assert!(matches!(recv(&mut c, "g1", "p1", 1, bad), Err(UserError::BadInput(_))), "{bad:?}");
++        }
++        assert_eq!(bal(&c, "g1", "p1", ON_HAND), 5);
++    }
++
++    #[test]
++    fn a_retry_still_succeeds_after_stock_has_since_changed() {
++        let mut c = shop();
++        adj(&mut c, AdjustKind::Correction, "main", "p1", 5, "key-seed-0001").unwrap();
++        let sub = adj(&mut c, AdjustKind::Correction, "main", "p1", -5, "key-minus-005").unwrap();
++        assert!(!sub.duplicate);
++        // the first answer was lost; the retry must not now fail with "not enough stock"
++        let retry = adj(&mut c, AdjustKind::Correction, "main", "p1", -5, "key-minus-005").unwrap();
++        assert!(retry.duplicate);
++        assert_eq!(bal(&c, "main", "p1", ON_HAND), 0);
++    }
++
++    #[test]
++    fn restocking_validates_quantity_product_and_location() {
++        let mut c = shop();
++        for q in [0, -3, 1_000_001] {
++            assert!(matches!(recv(&mut c, "g1", "p1", q, &format!("key-q-{q:>8}")), Err(UserError::BadInput(_))), "{q}");
++        }
++        assert!(matches!(recv(&mut c, "nowhere", "p1", 1, "key-unknown-loc"), Err(UserError::BadInput(_))));
++        assert!(matches!(recv(&mut c, "g1", "ghost", 1, "key-unknown-prd"), Err(UserError::BadInput(_))));
++        c.execute("UPDATE stock_locations SET is_active=0 WHERE id='g2'", []).unwrap();
++        assert!(matches!(recv(&mut c, "g2", "p1", 1, "key-inactive-lo"), Err(UserError::Conflict(_))));
++        let p = crate::catalog::get_product(&c, "t1", "p3").unwrap().unwrap();
++        set_product_active(&mut c, "t1", &me(), None, "p3", p.revision, false, T0).unwrap();
++        assert!(matches!(recv(&mut c, "g1", "p3", 1, "key-inactive-pr"), Err(UserError::Conflict(_))), "cannot restock a product that is switched off");
++        assert_eq!(n(&c, "stock_movements"), 0, "every refusal left the ledger alone");
++        assert_eq!(n(&c, "stock_operations"), 0);
++    }
++
++    #[test]
++    fn people_can_only_work_in_locations_they_may_use() {
++        let mut c = shop();
++        let limited = actor(&["inventory.adjust"], &["g1"]);
++        let r = |c: &mut Connection, loc: &str| receive_stock(c, "t1", &limited, None, &ReceiveRequest { location_id: loc, product_id: "p1", qty: 1, note: None, reference: None }, &format!("key-scope-{loc}-1"), T0);
++        assert!(r(&mut c, "g1").is_ok());
++        assert!(matches!(r(&mut c, "main"), Err(UserError::Forbidden("location_denied"))));
++        let a = adjust_stock(&mut c, "t1", &limited, None, &AdjustRequest { kind: AdjustKind::Correction, location_id: "g2", product_id: "p1", qty: 1, reason: "found" }, "key-scope-adj-01", T0);
++        assert!(matches!(a, Err(UserError::Forbidden("location_denied"))));
++        assert_eq!(n(&c, "stock_movements"), 1);
++    }
++
++    #[test]
++    fn adjustments_work_and_never_take_a_bucket_below_zero() {
++        let mut c = shop();
++        recv(&mut c, "main", "p1", 10, "key-seed-main1").unwrap();
++        adj(&mut c, AdjustKind::Correction, "main", "p1", 3, "key-corr-up-01").unwrap();
++        adj(&mut c, AdjustKind::Correction, "main", "p1", -2, "key-corr-dn-01").unwrap();
++        assert_eq!(bal(&c, "main", "p1", ON_HAND), 11);
++        adj(&mut c, AdjustKind::Damage, "main", "p1", 4, "key-damage-001").unwrap();
++        assert_eq!((bal(&c, "main", "p1", ON_HAND), bal(&c, "main", "p1", "damaged")), (7, 4));
++        adj(&mut c, AdjustKind::WriteOff, "main", "p1", 3, "key-writeoff-1").unwrap();
++        assert_eq!((bal(&c, "main", "p1", ON_HAND), bal(&c, "main", "p1", "damaged")), (7, 1));
++
++        let (ops, moves, audits, queued) = (n(&c, "stock_operations"), n(&c, "stock_movements"), n(&c, "audit_logs"), n(&c, "sync_outbox"));
++        let short = |r: Result<OpOutcome, UserError>| match r {
++            Err(UserError::Short { have, need, .. }) => (have, need),
++            other => panic!("expected a shortage, got {other:?}"),
++        };
++        assert_eq!(short(adj(&mut c, AdjustKind::Correction, "main", "p1", -8, "key-too-many-1")), (7, 8));
++        assert_eq!(short(adj(&mut c, AdjustKind::Damage, "main", "p1", 8, "key-too-many-2")), (7, 8));
++        assert_eq!(short(adj(&mut c, AdjustKind::WriteOff, "main", "p1", 2, "key-too-many-3")), (1, 2));
++        assert_eq!((n(&c, "stock_operations"), n(&c, "stock_movements"), n(&c, "audit_logs"), n(&c, "sync_outbox")), (ops, moves, audits, queued), "a refused adjustment leaves no trace");
++    }
++
++    #[test]
++    fn a_damage_that_fails_halfway_leaves_nothing_behind() {
++        let mut c = shop();
++        recv(&mut c, "main", "p1", 2, "key-seed-main2").unwrap();
++        assert!(adj(&mut c, AdjustKind::Damage, "main", "p1", 3, "key-damage-big1").is_err());
++        assert_eq!((bal(&c, "main", "p1", ON_HAND), bal(&c, "main", "p1", "damaged")), (2, 0));
++    }
++
++    #[test]
++    fn every_adjustment_needs_a_reason_and_inactive_products_can_still_be_adjusted() {
++        let mut c = shop();
++        recv(&mut c, "main", "p1", 5, "key-seed-main3").unwrap();
++        for reason in ["", "  ", "ab"] {
++            let r = adjust_stock(&mut c, "t1", &me(), None, &AdjustRequest { kind: AdjustKind::Correction, location_id: "main", product_id: "p1", qty: -1, reason }, "key-reason-0001", T0);
++            assert!(matches!(r, Err(UserError::BadInput(_))), "{reason:?}");
++        }
++        let p = crate::catalog::get_product(&c, "t1", "p1").unwrap().unwrap();
++        set_product_active(&mut c, "t1", &me(), None, "p1", p.revision, false, T0).unwrap();
++        adj(&mut c, AdjustKind::Correction, "main", "p1", -5, "key-inactive-adj").unwrap();
++        assert_eq!(bal(&c, "main", "p1", ON_HAND), 0);
++    }
++
++    #[test]
++    fn reorder_levels_flag_low_stock_and_can_be_cleared() {
++        let mut c = shop();
++        recv(&mut c, "main", "p1", 4, "key-seed-main4").unwrap();
++        recv(&mut c, "main", "p2", 40, "key-seed-main5").unwrap();
++        set_reorder_level(&mut c, "t1", &me(), None, "main", "p1", Some(5), T0).unwrap();
++        set_reorder_level(&mut c, "t1", &me(), None, "main", "p2", Some(5), T0).unwrap();
++        let low = stock_levels(&c, "t1", &me().access(), &StockQuery { low_only: true, ..Default::default() }).unwrap();
++        assert_eq!(low.items.iter().map(|i| i.product.id.as_str()).collect::<Vec<_>>(), ["p1"]);
++        assert!(low.items[0].low);
++        let all = stock_levels(&c, "t1", &me().access(), &StockQuery::default()).unwrap();
++        assert_eq!(all.items.iter().filter(|i| i.low).count(), 1);
++        set_reorder_level(&mut c, "t1", &me(), None, "main", "p1", None, T0).unwrap();
++        assert_eq!(stock_levels(&c, "t1", &me().access(), &StockQuery { low_only: true, ..Default::default() }).unwrap().total, 0);
++        // a level can be set before any stock exists, and bad levels are refused
++        set_reorder_level(&mut c, "t1", &me(), None, "g2", "p3", Some(2), T0).unwrap();
++        assert!(matches!(set_reorder_level(&mut c, "t1", &me(), None, "g2", "p3", Some(-1), T0), Err(UserError::BadInput(_))));
++        assert!(matches!(set_reorder_level(&mut c, "t1", &me(), None, "g2", "ghost", Some(1), T0), Err(UserError::BadInput(_))));
++        let level: Option<i64> = c.query_row("SELECT reorder_level FROM inventory_balances WHERE location_id='g2' AND product_id='p3'", [], |r| r.get(0)).unwrap();
++        assert_eq!(level, Some(2));
++        assert!(audit(&c).iter().any(|a| a.0 == "stock.reorder_level"));
++    }
++
++    #[test]
++    fn stock_levels_group_by_location_and_total_what_the_caller_can_see() {
++        let mut c = shop();
++        recv(&mut c, "main", "p1", 5, "key-lvl-main-p1").unwrap();
++        recv(&mut c, "g1", "p1", 20, "key-lvl-g1-p1a").unwrap();
++        recv(&mut c, "g2", "p1", 7, "key-lvl-g2-p1a").unwrap();
++        adj(&mut c, AdjustKind::Damage, "g1", "p1", 2, "key-lvl-damage1").unwrap();
++        c.execute("INSERT INTO inventory_balances(tenant_id,location_id,product_id,in_transit) VALUES ('t1','main','p2',3)", []).unwrap();
++
++        let all = stock_levels(&c, "t1", &me().access(), &StockQuery::default()).unwrap();
++        assert_eq!(all.total, 3, "zero-stock products are listed too, so they can be restocked");
++        let p1 = all.items.iter().find(|i| i.product.id == "p1").unwrap();
++        assert_eq!((p1.total_on_hand, p1.total_damaged, p1.total_in_transit), (30, 2, 0));
++        assert_eq!(p1.by_location.iter().map(|l| (l.location_id.as_str(), l.on_hand)).collect::<Vec<_>>(), [("g1", 18), ("g2", 7), ("main", 5)]);
++        assert_eq!(all.items.iter().find(|i| i.product.id == "p2").unwrap().total_in_transit, 3);
++        assert!(all.items.iter().find(|i| i.product.id == "p3").unwrap().by_location.is_empty());
++
++        // someone limited to the shop sees only the shop's quantities, and cannot ask about the godowns
++        let shop_only = actor(&["inventory.view"], &["main"]).access();
++        let mine = stock_levels(&c, "t1", &shop_only, &StockQuery::default()).unwrap();
++        let p1 = mine.items.iter().find(|i| i.product.id == "p1").unwrap();
++        assert_eq!((p1.total_on_hand, p1.by_location.len()), (5, 1), "the godowns' stock is not revealed in the total either");
++        assert!(matches!(stock_levels(&c, "t1", &shop_only, &StockQuery { location_id: Some("g1".into()), ..Default::default() }), Err(UserError::Forbidden("location_denied"))));
++        let one = stock_levels(&c, "t1", &me().access(), &StockQuery { location_id: Some("g1".into()), ..Default::default() }).unwrap();
++        assert_eq!(one.items.iter().find(|i| i.product.id == "p1").unwrap().total_on_hand, 18, "a location filter shows that location only");
++        let nobody = actor(&["inventory.view"], &[]).access();
++        assert!(stock_levels(&c, "t1", &nobody, &StockQuery::default()).unwrap().items.iter().all(|i| i.by_location.is_empty()));
++    }
++
++    #[test]
++    fn stock_search_uses_the_product_search_and_hides_dead_products() {
++        let mut c = shop();
++        let co = brands::create_company(&mut c, "t1", &me(), None, "Atlas Honda", T0).unwrap();
++        let br = brands::create_brand(&mut c, "t1", &me(), None, "Honda Genuine", Some(&co.id), T0).unwrap();
++        let hp = create_product(&mut c, "t1", &me(), None, &ProductInput { sku: "HG-1".into(), name: "Honda chain".into(), name_ur: Some("چین".into()), brand_id: Some(br.id.clone()), ..Default::default() }, T0).unwrap();
++        recv(&mut c, "main", &hp.id, 3, "key-search-seed1").unwrap();
++        let q = |c: &Connection, s: &str| stock_levels(c, "t1", &me().access(), &StockQuery { search: Some(s.into()), ..Default::default() }).unwrap();
++        assert_eq!(q(&c, "genuine").items.len(), 1, "by brand");
++        assert_eq!(q(&c, "چین").items.len(), 1, "by Urdu name");
++        assert_eq!(q(&c, "atlas").items[0].total_on_hand, 3, "by company");
++        let by_company = stock_levels(&c, "t1", &me().access(), &StockQuery { company_id: Some(co.id.clone()), ..Default::default() }).unwrap();
++        assert_eq!(by_company.total, 1);
++        // a switched-off product disappears from stock, unless it still holds stock
++        set_product_active(&mut c, "t1", &me(), None, "p2", 1, false, T0).unwrap();
++        set_product_active(&mut c, "t1", &me(), None, &hp.id, hp.revision, false, T0).unwrap();
++        let ids: Vec<String> = stock_levels(&c, "t1", &me().access(), &StockQuery::default()).unwrap().items.into_iter().map(|i| i.product.id).collect();
++        assert!(!ids.contains(&"p2".to_string()) && ids.contains(&hp.id), "{ids:?}");
++        // paging
++        let page = stock_levels(&c, "t1", &me().access(), &StockQuery { limit: 1, offset: 1, ..Default::default() }).unwrap();
++        assert_eq!((page.items.len(), page.total), (1, 3));
++    }
++
++    #[test]
++    fn movement_history_is_newest_first_filterable_and_limited_to_visible_locations() {
++        let mut c = shop();
++        recv(&mut c, "main", "p1", 5, "key-hist-main-01").unwrap();
++        recv(&mut c, "g1", "p1", 9, "key-hist-g1-0001").unwrap();
++        adj(&mut c, AdjustKind::Correction, "main", "p1", -1, "key-hist-adjust1").unwrap();
++        recv(&mut c, "main", "p2", 2, "key-hist-main-02").unwrap();
++        let all = movements(&c, "t1", &me().access(), &MovementQuery::default()).unwrap();
++        assert_eq!(all.total, 4);
++        assert_eq!(all.items.first().unwrap().product_id, "p2", "newest first");
++        assert_eq!(all.items.last().unwrap().qty_delta, 5);
++        assert_eq!(all.items[0].actor_name.as_deref(), Some("User One"), "who did it");
++        let p1 = movements(&c, "t1", &me().access(), &MovementQuery { product_id: Some("p1".into()), ..Default::default() }).unwrap();
++        assert_eq!(p1.total, 3);
++        let shop_only = actor(&["inventory.view"], &["main"]).access();
++        let mine = movements(&c, "t1", &shop_only, &MovementQuery { product_id: Some("p1".into()), ..Default::default() }).unwrap();
++        assert_eq!(mine.total, 2, "the godown's movement is not shown");
++        assert!(matches!(movements(&c, "t1", &shop_only, &MovementQuery { location_id: Some("g1".into()), ..Default::default() }), Err(UserError::Forbidden("location_denied"))));
++        let paged = movements(&c, "t1", &me().access(), &MovementQuery { limit: 2, offset: 2, ..Default::default() }).unwrap();
++        assert_eq!((paged.items.len(), paged.total), (2, 4));
++    }
++
++    #[test]
++    fn other_shops_stock_is_invisible() {
++        let mut c = shop();
++        c.execute_batch(
++            "INSERT INTO tenants(id,name) VALUES ('t2','Other');
++             INSERT INTO stock_locations(id,tenant_id,name,code) VALUES ('o1','t2','Other Loc','O1');
++             INSERT INTO products(id,tenant_id,sku,name) VALUES ('op1','t2','OP-1','Other part');",
++        )
++        .unwrap();
++        recv(&mut c, "main", "p1", 5, "key-iso-0000001").unwrap();
++        receive_stock(&mut c, "t2", &me(), None, &ReceiveRequest { location_id: "o1", product_id: "op1", qty: 9, note: None, reference: None }, "key-iso-0000002", T0).unwrap();
++        assert_eq!(stock_levels(&c, "t1", &me().access(), &StockQuery::default()).unwrap().total, 3);
++        assert_eq!(movements(&c, "t1", &me().access(), &MovementQuery::default()).unwrap().total, 1);
++        // a shop cannot post into another shop's location or product
++        assert!(matches!(recv(&mut c, "o1", "p1", 1, "key-iso-0000003"), Err(UserError::BadInput(_))));
++        assert!(matches!(recv(&mut c, "main", "op1", 1, "key-iso-0000004"), Err(UserError::BadInput(_))));
++    }
++}
+diff --git a/apps/desktop/src-tauri/crates/db/src/lib.rs b/apps/desktop/src-tauri/crates/db/src/lib.rs
+index 602266b..709cb6b 100644
+--- a/apps/desktop/src-tauri/crates/db/src/lib.rs
++++ b/apps/desktop/src-tauri/crates/db/src/lib.rs
+@@ -3,12 +3,17 @@
+ //! Rules: only the server process opens this file; all writes go through one writer thread;
+ //! migrations run inside a transaction after a backup.
+ 
++pub mod brands;
+ pub mod catalog;
++pub mod counts;
+ pub mod customers;
++pub mod inventory;
+ pub mod locations;
+ pub(crate) mod master;
+ pub mod pairing;
+ pub mod roles;
++pub mod stock;
++pub mod transfers;
+ pub mod users;
+ pub use rusqlite;
+ 
+@@ -56,6 +61,11 @@ pub const MIGRATIONS: &[Migration] = &[
+         name: "customers_and_catalog",
+         sql: include_str!("../migrations/0005_customers_and_catalog.sql"),
+     },
++    Migration {
++        version: 6,
++        name: "products_and_inventory",
++        sql: include_str!("../migrations/0006_products_and_inventory.sql"),
++    },
+ ];
+ 
+ pub fn open(path: &Path) -> Result<Connection, DbError> {
+@@ -152,8 +162,8 @@ mod tests {
+     #[test]
+     fn migrates_once_and_is_idempotent() {
+         let mut c = open_in_memory().unwrap();
+-        assert_eq!(migrate(&mut c).unwrap(), vec![1, 2, 3, 4, 5]);
+-        assert_eq!(current_version(&c).unwrap(), 5);
++        assert_eq!(migrate(&mut c).unwrap(), vec![1, 2, 3, 4, 5, 6]);
++        assert_eq!(current_version(&c).unwrap(), 6);
+         assert!(migrate(&mut c).unwrap().is_empty());
+     }
+ 
+diff --git a/apps/desktop/src-tauri/crates/db/src/roles.rs b/apps/desktop/src-tauri/crates/db/src/roles.rs
+index 03119aa..c452515 100644
+--- a/apps/desktop/src-tauri/crates/db/src/roles.rs
++++ b/apps/desktop/src-tauri/crates/db/src/roles.rs
+@@ -31,6 +31,7 @@ pub const PERMISSIONS: &[(&str, &str)] = &[
+     ("customers.view", "View customers"),
+     ("customers.manage", "Create and edit customers"),
+     ("inventory.view", "View stock"),
++    ("inventory.receive", "Receive stock (restock)"),
+     ("inventory.transfer", "Move stock between locations"),
+     ("inventory.adjust", "Adjust stock quantities"),
+     ("inventory.count", "Run stock counts"),
+diff --git a/apps/desktop/src-tauri/crates/db/src/stock.rs b/apps/desktop/src-tauri/crates/db/src/stock.rs
+new file mode 100644
+index 0000000..521b2c9
+--- /dev/null
++++ b/apps/desktop/src-tauri/crates/db/src/stock.rs
+@@ -0,0 +1,351 @@
++//! The core of stock handling: which ledger movements each operation produces, and posting them.
++//!
++//! The planners are pure functions that mirror `packages/domain/src/stock-ops.ts`; both are tested against
++//! `packages/test-vectors/stock-operations.json`, so the two languages cannot drift apart.
++//!
++//! Where in-transit stock lives: dispatched stock leaves the source's `on_hand` and shows up in the DESTINATION's
++//! `in_transit`; receiving moves it to the destination's `on_hand`; cancelling returns it to the source's `on_hand`.
++//!
++//! `post_all` writes the movements inside the caller's transaction: it refuses to take any bucket below zero (with a
++//! message that says how much there is), appends to the append-only ledger (the database trigger keeps the balances in
++//! step) and queues each movement for sync. Quantities are whole numbers.
++
++use crate::master::enqueue;
++use crate::users::{Principal, Scope, UserError};
++use rusqlite::{params, Connection, OptionalExtension};
++
++pub const ON_HAND: &str = "on_hand";
++pub const DAMAGED: &str = "damaged";
++pub const IN_TRANSIT: &str = "in_transit";
++
++/// Biggest quantity accepted in one line: stops a typo (an extra zero) from becoming a million parts.
++pub const MAX_QTY: i64 = 1_000_000;
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Planned {
++    pub location_id: String,
++    pub product_id: String,
++    pub bucket: &'static str,
++    pub delta: i64,
++    pub movement_type: &'static str,
++    pub key: String,
++}
++
++fn mv(location: &str, product: &str, bucket: &'static str, delta: i64, movement_type: &'static str, key: String) -> Planned {
++    Planned { location_id: location.into(), product_id: product.into(), bucket, delta, movement_type, key }
++}
++
++fn positive(qty: i64) -> Result<(), UserError> {
++    if qty <= 0 || qty > MAX_QTY {
++        return Err(UserError::BadInput("quantity must be a whole number from 1 to 1,000,000"));
++    }
++    Ok(())
++}
++
++pub fn plan_receive(location: &str, product: &str, qty: i64, key: &str) -> Result<Vec<Planned>, UserError> {
++    positive(qty)?;
++    Ok(vec![mv(location, product, ON_HAND, qty, "purchase", format!("{key}:m1"))])
++}
++
++/// `qty` is signed: positive for stock found, negative for stock lost.
++pub fn plan_correct(location: &str, product: &str, qty: i64, key: &str) -> Result<Vec<Planned>, UserError> {
++    if qty == 0 || qty.abs() > MAX_QTY {
++        return Err(UserError::BadInput("correction must be a whole number other than 0, up to 1,000,000"));
++    }
++    Ok(vec![mv(location, product, ON_HAND, qty, "adjustment", format!("{key}:m1"))])
++}
++
++pub fn plan_damage(location: &str, product: &str, qty: i64, key: &str) -> Result<Vec<Planned>, UserError> {
++    positive(qty)?;
++    Ok(vec![
++        mv(location, product, ON_HAND, -qty, "damage", format!("{key}:m1")),
++        mv(location, product, DAMAGED, qty, "damage", format!("{key}:m2")),
++    ])
++}
++
++pub fn plan_write_off(location: &str, product: &str, qty: i64, key: &str) -> Result<Vec<Planned>, UserError> {
++    positive(qty)?;
++    Ok(vec![mv(location, product, DAMAGED, -qty, "write_off", format!("{key}:m1"))])
++}
++
++/// (product id, quantity)
++pub type Lines = [(String, i64)];
++
++pub fn plan_dispatch(from: &str, to: &str, lines: &Lines, key: &str) -> Result<Vec<Planned>, UserError> {
++    if from == to {
++        return Err(UserError::BadInput("a transfer needs two different locations"));
++    }
++    let mut out = Vec::new();
++    for (i, (p, q)) in lines.iter().enumerate() {
++        positive(*q)?;
++        out.push(mv(from, p, ON_HAND, -q, "transfer_out", format!("{key}:{i}:out")));
++        out.push(mv(to, p, IN_TRANSIT, *q, "transfer_out", format!("{key}:{i}:transit")));
++    }
++    Ok(out)
++}
++
++pub fn plan_receive_transfer(to: &str, lines: &Lines, key: &str) -> Result<Vec<Planned>, UserError> {
++    let mut out = Vec::new();
++    for (i, (p, q)) in lines.iter().enumerate() {
++        positive(*q)?;
++        out.push(mv(to, p, IN_TRANSIT, -q, "transfer_in", format!("{key}:recv:{i}:transit")));
++        out.push(mv(to, p, ON_HAND, *q, "transfer_in", format!("{key}:recv:{i}:in")));
++    }
++    Ok(out)
++}
++
++pub fn plan_cancel_transfer(from: &str, to: &str, lines: &Lines, key: &str) -> Result<Vec<Planned>, UserError> {
++    let mut out = Vec::new();
++    for (i, (p, q)) in lines.iter().enumerate() {
++        positive(*q)?;
++        out.push(mv(to, p, IN_TRANSIT, -q, "transfer_cancel", format!("{key}:cancel:{i}:transit")));
++        out.push(mv(from, p, ON_HAND, *q, "transfer_cancel", format!("{key}:cancel:{i}:back")));
++    }
++    Ok(out)
++}
++
++/// (product id, expected, counted). Only differences become movements.
++pub type CountLines = [(String, i64, i64)];
++
++pub fn plan_count(location: &str, lines: &CountLines, key: &str) -> Result<Vec<Planned>, UserError> {
++    let mut out = Vec::new();
++    for (i, (p, expected, counted)) in lines.iter().enumerate() {
++        if *counted < 0 || *counted > MAX_QTY {
++            return Err(UserError::BadInput("counted quantity must be a whole number from 0 to 1,000,000"));
++        }
++        let delta = counted - expected;
++        if delta != 0 {
++            out.push(mv(location, p, ON_HAND, delta, "count_adjustment", format!("{key}:{i}:count")));
++        }
++    }
++    Ok(out)
++}
++
++// ---------- checks the operations share ----------
++
++/// An idempotency key made by the client for one attempt: it lets a retry be recognised, never repeated.
++pub fn clean_key(raw: &str) -> Result<String, UserError> {
++    let k = raw.trim();
++    if !(8..=80).contains(&k.len()) || !k.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.')) {
++        return Err(UserError::BadInput("idempotency_key must be 8 to 80 letters, digits or - _ : ."));
++    }
++    Ok(k.to_string())
++}
++
++/// The caller may use this location (defence in depth: the API checks it first).
++pub fn guard_location(actor: &Principal, location: &str) -> Result<(), UserError> {
++    actor
++        .check_scope(Scope { location_id: Some(location), route_id: None })
++        .map_err(|_| UserError::Forbidden("location_denied"))
++}
++
++pub fn require_location(tx: &Connection, tenant: &str, location: &str) -> Result<(), UserError> {
++    let active: Option<i64> = tx
++        .query_row("SELECT is_active FROM stock_locations WHERE tenant_id=?1 AND id=?2", params![tenant, location], |r| r.get(0))
++        .optional()?;
++    match active {
++        None => Err(UserError::BadInput("unknown location")),
++        Some(0) => Err(UserError::Conflict("that location is inactive")),
++        Some(_) => Ok(()),
++    }
++}
++
++/// `must_be_active`: restocking and moving need an active product; adjusting and counting do not.
++pub fn require_product(tx: &Connection, tenant: &str, product: &str, must_be_active: bool) -> Result<(), UserError> {
++    let active: Option<i64> = tx
++        .query_row("SELECT is_active FROM products WHERE tenant_id=?1 AND id=?2", params![tenant, product], |r| r.get(0))
++        .optional()?;
++    match active {
++        None => Err(UserError::BadInput("unknown product")),
++        Some(0) if must_be_active => Err(UserError::Conflict("that product is inactive")),
++        Some(_) => Ok(()),
++    }
++}
++
++pub fn bucket_balance(conn: &Connection, tenant: &str, location: &str, product: &str, bucket: &str) -> Result<i64, rusqlite::Error> {
++    let col = match bucket {
++        ON_HAND => "on_hand",
++        DAMAGED => "damaged",
++        _ => "in_transit",
++    };
++    Ok(conn
++        .query_row(
++            &format!("SELECT {col} FROM inventory_balances WHERE tenant_id=?1 AND location_id=?2 AND product_id=?3"),
++            params![tenant, location, product],
++            |r| r.get(0),
++        )
++        .optional()?
++        .unwrap_or(0))
++}
++
++/// Next number such as `TR-000001`, unique per shop. Runs inside the writer's transaction, so it cannot race.
++pub fn next_number(tx: &Connection, tenant: &str, table: &str, prefix: &str) -> Result<String, rusqlite::Error> {
++    debug_assert!(matches!(table, "stock_transfers" | "stock_counts"));
++    let mut n: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE tenant_id=?1"), [tenant], |r| r.get(0))?;
++    loop {
++        n += 1;
++        let candidate = format!("{prefix}-{n:06}");
++        let taken: bool = tx.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE tenant_id=?1 AND number=?2)"), params![tenant, candidate], |r| r.get(0))?;
++        if !taken {
++            return Ok(candidate);
++        }
++    }
++}
++
++/// Append the movements to the ledger. All or nothing: the caller's transaction is dropped on error.
++pub fn post_all(
++    tx: &Connection,
++    tenant: &str,
++    actor: &Principal,
++    device: Option<&str>,
++    source_type: &str,
++    source_id: &str,
++    planned: &[Planned],
++    now: &str,
++) -> Result<(), UserError> {
++    for m in planned {
++        let have = bucket_balance(tx, tenant, &m.location_id, &m.product_id, m.bucket)?;
++        if have + m.delta < 0 {
++            return Err(UserError::Short { product_id: m.product_id.clone(), location_id: m.location_id.clone(), have, need: -m.delta });
++        }
++        let id = uuid::Uuid::new_v4().to_string();
++        tx.execute(
++            "INSERT INTO stock_movements(id,tenant_id,location_id,product_id,bucket,qty_delta,movement_type,source_type,source_id,
++                                         idempotency_key,origin_type,device_id,actor_id,occurred_at)
++             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'server',?11,?12,?13)",
++            params![id, tenant, m.location_id, m.product_id, m.bucket, m.delta, m.movement_type, source_type, source_id, m.key, device, actor.user_id, now],
++        )?;
++        let snapshot = serde_json::json!({
++            "id": id, "location_id": m.location_id, "product_id": m.product_id, "bucket": m.bucket, "qty_delta": m.delta,
++            "movement_type": m.movement_type, "source_type": source_type, "source_id": source_id, "idempotency_key": m.key, "occurred_at": now,
++        });
++        enqueue(tx, tenant, "stock_movement", &id, "post", &snapshot, None, 1)?;
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Run one vector case through the matching planner.
++    fn run(op: &str, i: &serde_json::Value) -> Result<Vec<Planned>, UserError> {
++        let st = |k: &str| i[k].as_str().unwrap_or("").to_string();
++        let qty = || {
++            // a fractional quantity in a vector must be refused, so it cannot be silently truncated
++            let q = &i["qty"];
++            if let Some(n) = q.as_i64() {
++                Ok(n)
++            } else {
++                Err(UserError::BadInput("quantity must be a whole number"))
++            }
++        };
++        let lines = || -> Vec<(String, i64)> { i["lines"].as_array().unwrap().iter().map(|l| (l["product"].as_str().unwrap().to_string(), l["qty"].as_i64().unwrap())).collect() };
++        match op {
++            "receive" => plan_receive(&st("location"), &st("product"), qty()?, &st("key")),
++            "correct" => plan_correct(&st("location"), &st("product"), qty()?, &st("key")),
++            "damage" => plan_damage(&st("location"), &st("product"), qty()?, &st("key")),
++            "write_off" => plan_write_off(&st("location"), &st("product"), qty()?, &st("key")),
++            "dispatch" => plan_dispatch(&st("from"), &st("to"), &lines(), &st("key")),
++            "receive_transfer" => plan_receive_transfer(&st("to"), &lines(), &st("key")),
++            "cancel_transfer" => plan_cancel_transfer(&st("from"), &st("to"), &lines(), &st("key")),
++            "count" => {
++                let cl: Vec<(String, i64, i64)> = i["lines"].as_array().unwrap().iter().map(|l| (l["product"].as_str().unwrap().to_string(), l["expected"].as_i64().unwrap(), l["counted"].as_i64().unwrap())).collect();
++                plan_count(&st("location"), &cl, &st("key"))
++            }
++            other => panic!("unknown op {other}"),
++        }
++    }
++
++    fn vectors() -> serde_json::Value {
++        serde_json::from_str(include_str!("../../../../../../packages/test-vectors/stock-operations.json")).unwrap()
++    }
++
++    fn wire(p: &Planned) -> serde_json::Value {
++        serde_json::json!({ "location": p.location_id, "product": p.product_id, "bucket": p.bucket, "delta": p.delta, "type": p.movement_type, "key": p.key })
++    }
++
++    #[test]
++    fn the_planners_produce_exactly_the_movements_in_the_shared_vectors() {
++        let v = vectors();
++        let cases = v["movements"].as_array().unwrap();
++        assert!(cases.len() >= 9);
++        for c in cases {
++            let got: Vec<serde_json::Value> = run(c["op"].as_str().unwrap(), &c["input"]).unwrap().iter().map(wire).collect();
++            assert_eq!(serde_json::Value::Array(got), c["expect"], "{}", c["name"]);
++        }
++    }
++
++    #[test]
++    fn the_planners_refuse_what_the_shared_vectors_refuse() {
++        let v = vectors();
++        let cases = v["errors"].as_array().unwrap();
++        assert!(cases.len() >= 8);
++        for c in cases {
++            assert!(run(c["op"].as_str().unwrap(), &c["input"]).is_err(), "{}", c["name"]);
++        }
++    }
++
++    #[test]
++    fn the_scenarios_leave_the_balances_the_vectors_expect_on_a_real_ledger() {
++        use crate::master::testutil::*;
++        let v = vectors();
++        for sc in v["scenarios"].as_array().unwrap() {
++            let mut c = setup();
++            c.execute_batch(
++                "INSERT INTO stock_locations(id,tenant_id,name,code) VALUES ('main','t1','Main','MAIN'),('g1','t1','Godown','G1');
++                 INSERT INTO products(id,tenant_id,sku,name) VALUES ('p1','t1','P1','Part 1'),('p2','t1','P2','Part 2'),('p3','t1','P3','Part 3');",
++            )
++            .unwrap();
++            let me = actor(&["*"], &[]);
++            for (n, step) in sc["steps"].as_array().unwrap().iter().enumerate() {
++                let planned = run(step["op"].as_str().unwrap(), &step["input"]).unwrap();
++                let tx = c.transaction().unwrap();
++                let res = post_all(&tx, "t1", &me, None, "test", &format!("s{n}"), &planned, T0);
++                let expect_rejected = step["expectRejected"].as_bool().unwrap_or(false);
++                assert_eq!(res.is_err(), expect_rejected, "{} step {n}", sc["name"]);
++                if res.is_ok() {
++                    tx.commit().unwrap();
++                } // otherwise the transaction is dropped: nothing from this step remains
++            }
++            for (k, want) in sc["balances"].as_object().unwrap() {
++                let (loc, prod) = k.split_once('|').unwrap();
++                for b in [ON_HAND, DAMAGED, IN_TRANSIT] {
++                    assert_eq!(bucket_balance(&c, "t1", loc, prod, b).unwrap(), want[b].as_i64().unwrap(), "{} {k} {b}", sc["name"]);
++                }
++            }
++            // the balance table always equals the sum of the ledger
++            let drift: i64 = c.query_row(
++                "SELECT COUNT(*) FROM inventory_balances ib WHERE ib.on_hand <> COALESCE((SELECT SUM(qty_delta) FROM stock_movements m WHERE m.location_id=ib.location_id AND m.product_id=ib.product_id AND m.bucket='on_hand'),0)",
++                [],
++                |r| r.get(0),
++            )
++            .unwrap();
++            assert_eq!(drift, 0, "{}", sc["name"]);
++        }
++    }
++
++    #[test]
++    fn a_short_posting_names_what_is_available_and_needed() {
++        use crate::master::testutil::*;
++        let mut c = setup();
++        c.execute_batch(
++            "INSERT INTO stock_locations(id,tenant_id,name,code) VALUES ('main','t1','Main','MAIN');
++             INSERT INTO products(id,tenant_id,sku,name) VALUES ('p1','t1','P1','Part 1');",
++        )
++        .unwrap();
++        let me = actor(&["*"], &[]);
++        let tx = c.transaction().unwrap();
++        post_all(&tx, "t1", &me, None, "t", "s", &plan_receive("main", "p1", 3, "k-aaaa1111").unwrap(), T0).unwrap();
++        let err = post_all(&tx, "t1", &me, None, "t", "s", &plan_damage("main", "p1", 5, "k-bbbb2222").unwrap(), T0).unwrap_err();
++        assert!(matches!(err, UserError::Short { have: 3, need: 5, .. }), "{err:?}");
++    }
++
++    #[test]
++    fn keys_are_checked() {
++        assert_eq!(clean_key("  abc-12345  ").unwrap(), "abc-12345");
++        for bad in ["short", "has space in it", "ünïcode-key-1", &"x".repeat(81), ""] {
++            assert!(clean_key(bad).is_err(), "{bad:?}");
++        }
++    }
++}
+diff --git a/apps/desktop/src-tauri/crates/db/src/users.rs b/apps/desktop/src-tauri/crates/db/src/users.rs
+index 316d49b..226e15b 100644
+--- a/apps/desktop/src-tauri/crates/db/src/users.rs
++++ b/apps/desktop/src-tauri/crates/db/src/users.rs
+@@ -40,6 +40,9 @@ pub enum UserError {
+     /// The caller may not do this (for example grant permissions they do not hold themselves).
+     #[error("{0}")]
+     Forbidden(&'static str),
++    /// A stock bucket would go below zero: `have` is what is there, `need` what was asked for.
++    #[error("not enough stock")]
++    Short { product_id: String, location_id: String, have: i64, need: i64 },
+     /// The record changed since the caller read it (optimistic concurrency): reload and retry.
+     #[error("stale revision")]
+     Stale,
+diff --git a/packages/domain/src/index.ts b/packages/domain/src/index.ts
+index 9e3421e..8900ec7 100644
+--- a/packages/domain/src/index.ts
++++ b/packages/domain/src/index.ts
+@@ -2,3 +2,4 @@ export * from "./money.ts";
+ export * from "./permissions.ts";
+ export * from "./ledger.ts";
+ export * from "./entitlement.ts";
++export * from "./stock-ops.ts";
+diff --git a/packages/domain/src/stock-ops.ts b/packages/domain/src/stock-ops.ts
+new file mode 100644
+index 0000000..86b52f4
+--- /dev/null
++++ b/packages/domain/src/stock-ops.ts
+@@ -0,0 +1,96 @@
++// Which ledger movements each stock operation produces. The Rust code (crates/db/src/stock.rs) must produce exactly the
++// same list; packages/test-vectors/stock-operations.json is checked by both. Buckets and the "never below zero" rule are
++// in ledger.ts.
++//
++// Where in-transit stock lives: when stock is dispatched it leaves the source's on_hand and appears in the DESTINATION's
++// in_transit bucket, so the destination can see what is coming. Receiving moves it to the destination's on_hand;
++// cancelling sends it back to the source's on_hand. Total stock is never counted twice.
++import type { Bucket } from "./ledger.ts";
++
++export type MovementType =
++  | "purchase" | "adjustment" | "damage" | "write_off"
++  | "transfer_out" | "transfer_in" | "transfer_cancel" | "count_adjustment";
++
++export interface PlannedMovement {
++  locationId: string;
++  productId: string;
++  bucket: Bucket;
++  delta: number;
++  type: MovementType;
++  key: string;
++}
++
++function positive(qty: number, what = "quantity") {
++  if (!Number.isInteger(qty) || qty <= 0) throw new Error(`${what} must be a positive whole number`);
++}
++
++/** Restock: stock arrives at a location. */
++export function receiveStock(p: { location: string; product: string; qty: number; key: string }): PlannedMovement[] {
++  positive(p.qty);
++  return [{ locationId: p.location, productId: p.product, bucket: "on_hand", delta: p.qty, type: "purchase", key: `${p.key}:m1` }];
++}
++
++/** Correction: the quantity is signed (+ found, - lost). */
++export function correctStock(p: { location: string; product: string; qty: number; key: string }): PlannedMovement[] {
++  if (!Number.isInteger(p.qty) || p.qty === 0) throw new Error("correction must be a non-zero whole number");
++  return [{ locationId: p.location, productId: p.product, bucket: "on_hand", delta: p.qty, type: "adjustment", key: `${p.key}:m1` }];
++}
++
++/** Damage: good stock becomes damaged stock at the same location. */
++export function damageStock(p: { location: string; product: string; qty: number; key: string }): PlannedMovement[] {
++  positive(p.qty);
++  return [
++    { locationId: p.location, productId: p.product, bucket: "on_hand", delta: -p.qty, type: "damage", key: `${p.key}:m1` },
++    { locationId: p.location, productId: p.product, bucket: "damaged", delta: p.qty, type: "damage", key: `${p.key}:m2` },
++  ];
++}
++
++/** Write-off: damaged stock is thrown away. */
++export function writeOffStock(p: { location: string; product: string; qty: number; key: string }): PlannedMovement[] {
++  positive(p.qty);
++  return [{ locationId: p.location, productId: p.product, bucket: "damaged", delta: -p.qty, type: "write_off", key: `${p.key}:m1` }];
++}
++
++interface TransferLine { product: string; qty: number }
++
++export function dispatchTransfer(p: { from: string; to: string; lines: TransferLine[]; key: string }): PlannedMovement[] {
++  if (p.from === p.to) throw new Error("transfer source and destination must differ");
++  return p.lines.flatMap((l, i) => {
++    positive(l.qty);
++    return [
++      { locationId: p.from, productId: l.product, bucket: "on_hand" as const, delta: -l.qty, type: "transfer_out" as const, key: `${p.key}:${i}:out` },
++      { locationId: p.to, productId: l.product, bucket: "in_transit" as const, delta: l.qty, type: "transfer_out" as const, key: `${p.key}:${i}:transit` },
++    ];
++  });
++}
++
++export function receiveTransfer(p: { to: string; lines: TransferLine[]; key: string }): PlannedMovement[] {
++  return p.lines.flatMap((l, i) => {
++    positive(l.qty);
++    return [
++      { locationId: p.to, productId: l.product, bucket: "in_transit" as const, delta: -l.qty, type: "transfer_in" as const, key: `${p.key}:recv:${i}:transit` },
++      { locationId: p.to, productId: l.product, bucket: "on_hand" as const, delta: l.qty, type: "transfer_in" as const, key: `${p.key}:recv:${i}:in` },
++    ];
++  });
++}
++
++export function cancelTransfer(p: { from: string; to: string; lines: TransferLine[]; key: string }): PlannedMovement[] {
++  return p.lines.flatMap((l, i) => {
++    positive(l.qty);
++    return [
++      { locationId: p.to, productId: l.product, bucket: "in_transit" as const, delta: -l.qty, type: "transfer_cancel" as const, key: `${p.key}:cancel:${i}:transit` },
++      { locationId: p.from, productId: l.product, bucket: "on_hand" as const, delta: l.qty, type: "transfer_cancel" as const, key: `${p.key}:cancel:${i}:back` },
++    ];
++  });
++}
++
++/** A stock count: each line compares what was counted with what the system had; a difference is one movement. */
++export function countAdjustments(p: { location: string; lines: { product: string; expected: number; counted: number }[]; key: string }): PlannedMovement[] {
++  const out: PlannedMovement[] = [];
++  p.lines.forEach((l, i) => {
++    if (!Number.isInteger(l.counted) || l.counted < 0) throw new Error("counted quantity must be zero or more");
++    const delta = l.counted - l.expected;
++    if (delta !== 0) out.push({ locationId: p.location, productId: l.product, bucket: "on_hand", delta, type: "count_adjustment", key: `${p.key}:${i}:count` });
++  });
++  return out;
++}
+diff --git a/packages/domain/test/domain.test.ts b/packages/domain/test/domain.test.ts
+index 222bf5f..93a9c53 100644
+--- a/packages/domain/test/domain.test.ts
++++ b/packages/domain/test/domain.test.ts
+@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
+ import { readFileSync } from "node:fs";
+ import { verify } from "../../../tools/dev-license-key.mjs";
+ import { InMemoryLedger, transferMovements, authorize, hasPermission,
++  receiveStock, correctStock, damageStock, writeOffStock, dispatchTransfer, receiveTransfer, cancelTransfer, countAdjustments,
++  type PlannedMovement,
+   evaluate, canWrite, isIsoSeconds,
+   money, add, sub, fromDecimal, toDecimal, applyBps, allocate } from "../src/index.ts";
+ 
+@@ -95,3 +97,41 @@ test("vector payloads carry the fields the server relies on", () => {
+   for (const k of ["tenant_id", "revision", "status", "issued_at", "full_until", "grace_until", "limits"]) assert.ok(k in p, k);
+   assert.ok(isIsoSeconds(p.issued_at) && isIsoSeconds(p.full_until) && isIsoSeconds(p.grace_until));
+ });
++
++// ---- shared stock-operation vectors (the Rust inventory code runs the same file) ----
++const stockOps: Record<string, (i: any) => PlannedMovement[]> = {
++  receive: receiveStock, correct: correctStock, damage: damageStock, write_off: writeOffStock,
++  dispatch: dispatchTransfer, receive_transfer: receiveTransfer, cancel_transfer: cancelTransfer, count: countAdjustments,
++};
++const ops = vec("stock-operations.json");
++const wire = (m: PlannedMovement) => ({ location: m.locationId, product: m.productId, bucket: m.bucket, delta: m.delta, type: m.type, key: m.key });
++
++for (const c of ops.movements) {
++  test(`stock operation vector: ${c.name}`, () => {
++    assert.deepEqual(stockOps[c.op]!(c.input).map(wire), c.expect);
++  });
++}
++for (const c of ops.errors) {
++  test(`stock operation vector (refused): ${c.name}`, () => {
++    assert.throws(() => stockOps[c.op]!(c.input));
++  });
++}
++/** Post a whole operation or none of it, like the database transaction does. */
++function postAtomically(ledger: InMemoryLedger, ms: PlannedMovement[]): boolean {
++  const trial = new InMemoryLedger();
++  for (const m of ledger.movements) trial.post(m);
++  if (!ms.every((m) => trial.post(m) === "posted")) return false;
++  ms.forEach((m) => ledger.post(m));
++  return true;
++}
++for (const sc of ops.scenarios) {
++  test(`stock scenario: ${sc.name}`, () => {
++    const l = new InMemoryLedger();
++    for (const step of sc.steps) {
++      const ok = postAtomically(l, stockOps[step.op]!(step.input));
++      assert.equal(ok, !step.expectRejected, `step ${step.op}`);
++    }
++    for (const [k, want] of Object.entries(sc.balances)) assert.deepEqual(l.balance(...(k.split("|") as [string, string])), want, k);
++    for (const [k, b] of l.rebuild()) assert.deepEqual(l.balance(...(k.split("|") as [string, string])), b);
++  });
++}
+diff --git a/packages/test-vectors/stock-operations.json b/packages/test-vectors/stock-operations.json
+new file mode 100644
+index 0000000..ef5d4d0
+--- /dev/null
++++ b/packages/test-vectors/stock-operations.json
+@@ -0,0 +1,648 @@
++{
++ "movements": [
++  {
++   "name": "restock",
++   "op": "receive",
++   "input": {
++    "location": "main",
++    "product": "p1",
++    "qty": 12,
++    "key": "k1"
++   },
++   "expect": [
++    {
++     "location": "main",
++     "product": "p1",
++     "bucket": "on_hand",
++     "delta": 12,
++     "type": "purchase",
++     "key": "k1:m1"
++    }
++   ]
++  },
++  {
++   "name": "correction down",
++   "op": "correct",
++   "input": {
++    "location": "main",
++    "product": "p1",
++    "qty": -3,
++    "key": "k2"
++   },
++   "expect": [
++    {
++     "location": "main",
++     "product": "p1",
++     "bucket": "on_hand",
++     "delta": -3,
++     "type": "adjustment",
++     "key": "k2:m1"
++    }
++   ]
++  },
++  {
++   "name": "correction up",
++   "op": "correct",
++   "input": {
++    "location": "main",
++    "product": "p1",
++    "qty": 2,
++    "key": "k3"
++   },
++   "expect": [
++    {
++     "location": "main",
++     "product": "p1",
++     "bucket": "on_hand",
++     "delta": 2,
++     "type": "adjustment",
++     "key": "k3:m1"
++    }
++   ]
++  },
++  {
++   "name": "damage moves good stock to damaged",
++   "op": "damage",
++   "input": {
++    "location": "g1",
++    "product": "p2",
++    "qty": 4,
++    "key": "k4"
++   },
++   "expect": [
++    {
++     "location": "g1",
++     "product": "p2",
++     "bucket": "on_hand",
++     "delta": -4,
++     "type": "damage",
++     "key": "k4:m1"
++    },
++    {
++     "location": "g1",
++     "product": "p2",
++     "bucket": "damaged",
++     "delta": 4,
++     "type": "damage",
++     "key": "k4:m2"
++    }
++   ]
++  },
++  {
++   "name": "write-off removes damaged stock",
++   "op": "write_off",
++   "input": {
++    "location": "g1",
++    "product": "p2",
++    "qty": 4,
++    "key": "k5"
++   },
++   "expect": [
++    {
++     "location": "g1",
++     "product": "p2",
++     "bucket": "damaged",
++     "delta": -4,
++     "type": "write_off",
++     "key": "k5:m1"
++    }
++   ]
++  },
++  {
++   "name": "dispatch puts stock in transit at the destination",
++   "op": "dispatch",
++   "input": {
++    "from": "g1",
++    "to": "main",
++    "lines": [
++     {
++      "product": "p1",
++      "qty": 5
++     },
++     {
++      "product": "p2",
++      "qty": 2
++     }
++    ],
++    "key": "t1"
++   },
++   "expect": [
++    {
++     "location": "g1",
++     "product": "p1",
++     "bucket": "on_hand",
++     "delta": -5,
++     "type": "transfer_out",
++     "key": "t1:0:out"
++    },
++    {
++     "location": "main",
++     "product": "p1",
++     "bucket": "in_transit",
++     "delta": 5,
++     "type": "transfer_out",
++     "key": "t1:0:transit"
++    },
++    {
++     "location": "g1",
++     "product": "p2",
++     "bucket": "on_hand",
++     "delta": -2,
++     "type": "transfer_out",
++     "key": "t1:1:out"
++    },
++    {
++     "location": "main",
++     "product": "p2",
++     "bucket": "in_transit",
++     "delta": 2,
++     "type": "transfer_out",
++     "key": "t1:1:transit"
++    }
++   ]
++  },
++  {
++   "name": "receiving moves in-transit stock to on hand",
++   "op": "receive_transfer",
++   "input": {
++    "to": "main",
++    "lines": [
++     {
++      "product": "p1",
++      "qty": 5
++     }
++    ],
++    "key": "t1"
++   },
++   "expect": [
++    {
++     "location": "main",
++     "product": "p1",
++     "bucket": "in_transit",
++     "delta": -5,
++     "type": "transfer_in",
++     "key": "t1:recv:0:transit"
++    },
++    {
++     "location": "main",
++     "product": "p1",
++     "bucket": "on_hand",
++     "delta": 5,
++     "type": "transfer_in",
++     "key": "t1:recv:0:in"
++    }
++   ]
++  },
++  {
++   "name": "cancelling returns stock to the source",
++   "op": "cancel_transfer",
++   "input": {
++    "from": "g1",
++    "to": "main",
++    "lines": [
++     {
++      "product": "p1",
++      "qty": 5
++     }
++    ],
++    "key": "t1"
++   },
++   "expect": [
++    {
++     "location": "main",
++     "product": "p1",
++     "bucket": "in_transit",
++     "delta": -5,
++     "type": "transfer_cancel",
++     "key": "t1:cancel:0:transit"
++    },
++    {
++     "location": "g1",
++     "product": "p1",
++     "bucket": "on_hand",
++     "delta": 5,
++     "type": "transfer_cancel",
++     "key": "t1:cancel:0:back"
++    }
++   ]
++  },
++  {
++   "name": "count: only differences become movements",
++   "op": "count",
++   "input": {
++    "location": "main",
++    "lines": [
++     {
++      "product": "p1",
++      "expected": 10,
++      "counted": 10
++     },
++     {
++      "product": "p2",
++      "expected": 10,
++      "counted": 7
++     },
++     {
++      "product": "p3",
++      "expected": 0,
++      "counted": 4
++     }
++    ],
++    "key": "c1"
++   },
++   "expect": [
++    {
++     "location": "main",
++     "product": "p2",
++     "bucket": "on_hand",
++     "delta": -3,
++     "type": "count_adjustment",
++     "key": "c1:1:count"
++    },
++    {
++     "location": "main",
++     "product": "p3",
++     "bucket": "on_hand",
++     "delta": 4,
++     "type": "count_adjustment",
++     "key": "c1:2:count"
++    }
++   ]
++  }
++ ],
++ "errors": [
++  {
++   "name": "restock needs a positive whole number",
++   "op": "receive",
++   "input": {
++    "location": "main",
++    "product": "p1",
++    "qty": 0,
++    "key": "e1"
++   }
++  },
++  {
++   "name": "restock rejects fractions",
++   "op": "receive",
++   "input": {
++    "location": "main",
++    "product": "p1",
++    "qty": 1.5,
++    "key": "e2"
++   }
++  },
++  {
++   "name": "correction needs a non-zero number",
++   "op": "correct",
++   "input": {
++    "location": "main",
++    "product": "p1",
++    "qty": 0,
++    "key": "e3"
++   }
++  },
++  {
++   "name": "damage needs a positive quantity",
++   "op": "damage",
++   "input": {
++    "location": "main",
++    "product": "p1",
++    "qty": -1,
++    "key": "e4"
++   }
++  },
++  {
++   "name": "write-off needs a positive quantity",
++   "op": "write_off",
++   "input": {
++    "location": "main",
++    "product": "p1",
++    "qty": 0,
++    "key": "e5"
++   }
++  },
++  {
++   "name": "transfer to the same place is refused",
++   "op": "dispatch",
++   "input": {
++    "from": "main",
++    "to": "main",
++    "lines": [
++     {
++      "product": "p1",
++      "qty": 1
++     }
++    ],
++    "key": "e6"
++   }
++  },
++  {
++   "name": "transfer lines need a positive quantity",
++   "op": "dispatch",
++   "input": {
++    "from": "g1",
++    "to": "main",
++    "lines": [
++     {
++      "product": "p1",
++      "qty": 0
++     }
++    ],
++    "key": "e7"
++   }
++  },
++  {
++   "name": "a count cannot be negative",
++   "op": "count",
++   "input": {
++    "location": "main",
++    "lines": [
++     {
++      "product": "p1",
++      "expected": 5,
++      "counted": -1
++     }
++    ],
++    "key": "e8"
++   }
++  }
++ ],
++ "scenarios": [
++  {
++   "name": "restock then dispatch then receive",
++   "steps": [
++    {
++     "op": "receive",
++     "input": {
++      "location": "g1",
++      "product": "p1",
++      "qty": 20,
++      "key": "a"
++     }
++    },
++    {
++     "op": "dispatch",
++     "input": {
++      "from": "g1",
++      "to": "main",
++      "lines": [
++       {
++        "product": "p1",
++        "qty": 8
++       }
++      ],
++      "key": "b"
++     }
++    },
++    {
++     "op": "receive_transfer",
++     "input": {
++      "to": "main",
++      "lines": [
++       {
++        "product": "p1",
++        "qty": 8
++       }
++      ],
++      "key": "b"
++     }
++    }
++   ],
++   "balances": {
++    "g1|p1": {
++     "on_hand": 12,
++     "damaged": 0,
++     "in_transit": 0
++    },
++    "main|p1": {
++     "on_hand": 8,
++     "damaged": 0,
++     "in_transit": 0
++    }
++   }
++  },
++  {
++   "name": "dispatch is visible as in transit until received",
++   "steps": [
++    {
++     "op": "receive",
++     "input": {
++      "location": "g1",
++      "product": "p1",
++      "qty": 10,
++      "key": "a"
++     }
++    },
++    {
++     "op": "dispatch",
++     "input": {
++      "from": "g1",
++      "to": "main",
++      "lines": [
++       {
++        "product": "p1",
++        "qty": 4
++       }
++      ],
++      "key": "b"
++     }
++    }
++   ],
++   "balances": {
++    "g1|p1": {
++     "on_hand": 6,
++     "damaged": 0,
++     "in_transit": 0
++    },
++    "main|p1": {
++     "on_hand": 0,
++     "damaged": 0,
++     "in_transit": 4
++    }
++   }
++  },
++  {
++   "name": "a cancelled transfer leaves everything as it was",
++   "steps": [
++    {
++     "op": "receive",
++     "input": {
++      "location": "g1",
++      "product": "p1",
++      "qty": 10,
++      "key": "a"
++     }
++    },
++    {
++     "op": "dispatch",
++     "input": {
++      "from": "g1",
++      "to": "main",
++      "lines": [
++       {
++        "product": "p1",
++        "qty": 4
++       }
++      ],
++      "key": "b"
++     }
++    },
++    {
++     "op": "cancel_transfer",
++     "input": {
++      "from": "g1",
++      "to": "main",
++      "lines": [
++       {
++        "product": "p1",
++        "qty": 4
++       }
++      ],
++      "key": "b"
++     }
++    }
++   ],
++   "balances": {
++    "g1|p1": {
++     "on_hand": 10,
++     "damaged": 0,
++     "in_transit": 0
++    },
++    "main|p1": {
++     "on_hand": 0,
++     "damaged": 0,
++     "in_transit": 0
++    }
++   }
++  },
++  {
++   "name": "damage then write-off",
++   "steps": [
++    {
++     "op": "receive",
++     "input": {
++      "location": "main",
++      "product": "p1",
++      "qty": 10,
++      "key": "a"
++     }
++    },
++    {
++     "op": "damage",
++     "input": {
++      "location": "main",
++      "product": "p1",
++      "qty": 3,
++      "key": "b"
++     }
++    },
++    {
++     "op": "write_off",
++     "input": {
++      "location": "main",
++      "product": "p1",
++      "qty": 2,
++      "key": "c"
++     }
++    }
++   ],
++   "balances": {
++    "main|p1": {
++     "on_hand": 7,
++     "damaged": 1,
++     "in_transit": 0
++    }
++   }
++  },
++  {
++   "name": "a count that finds fewer and more",
++   "steps": [
++    {
++     "op": "receive",
++     "input": {
++      "location": "main",
++      "product": "p1",
++      "qty": 10,
++      "key": "a"
++     }
++    },
++    {
++     "op": "receive",
++     "input": {
++      "location": "main",
++      "product": "p2",
++      "qty": 10,
++      "key": "b"
++     }
++    },
++    {
++     "op": "count",
++     "input": {
++      "location": "main",
++      "lines": [
++       {
++        "product": "p1",
++        "expected": 10,
++        "counted": 7
++       },
++       {
++        "product": "p2",
++        "expected": 10,
++        "counted": 12
++       }
++      ],
++      "key": "c"
++     }
++    }
++   ],
++   "balances": {
++    "main|p1": {
++     "on_hand": 7,
++     "damaged": 0,
++     "in_transit": 0
++    },
++    "main|p2": {
++     "on_hand": 12,
++     "damaged": 0,
++     "in_transit": 0
++    }
++   }
++  },
++  {
++   "name": "moving more than is on hand is rejected and changes nothing",
++   "steps": [
++    {
++     "op": "receive",
++     "input": {
++      "location": "g1",
++      "product": "p1",
++      "qty": 3,
++      "key": "a"
++     }
++    },
++    {
++     "op": "dispatch",
++     "input": {
++      "from": "g1",
++      "to": "main",
++      "lines": [
++       {
++        "product": "p1",
++        "qty": 5
++       }
++      ],
++      "key": "b"
++     },
++     "expectRejected": true
++    }
++   ],
++   "balances": {
++    "g1|p1": {
++     "on_hand": 3,
++     "damaged": 0,
++     "in_transit": 0
++    }
++   }
++  }
++ ]
++}
+\ No newline at end of file

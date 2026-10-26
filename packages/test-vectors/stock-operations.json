@@ -1,0 +1,648 @@
+{
+ "movements": [
+  {
+   "name": "restock",
+   "op": "receive",
+   "input": {
+    "location": "main",
+    "product": "p1",
+    "qty": 12,
+    "key": "k1"
+   },
+   "expect": [
+    {
+     "location": "main",
+     "product": "p1",
+     "bucket": "on_hand",
+     "delta": 12,
+     "type": "purchase",
+     "key": "k1:m1"
+    }
+   ]
+  },
+  {
+   "name": "correction down",
+   "op": "correct",
+   "input": {
+    "location": "main",
+    "product": "p1",
+    "qty": -3,
+    "key": "k2"
+   },
+   "expect": [
+    {
+     "location": "main",
+     "product": "p1",
+     "bucket": "on_hand",
+     "delta": -3,
+     "type": "adjustment",
+     "key": "k2:m1"
+    }
+   ]
+  },
+  {
+   "name": "correction up",
+   "op": "correct",
+   "input": {
+    "location": "main",
+    "product": "p1",
+    "qty": 2,
+    "key": "k3"
+   },
+   "expect": [
+    {
+     "location": "main",
+     "product": "p1",
+     "bucket": "on_hand",
+     "delta": 2,
+     "type": "adjustment",
+     "key": "k3:m1"
+    }
+   ]
+  },
+  {
+   "name": "damage moves good stock to damaged",
+   "op": "damage",
+   "input": {
+    "location": "g1",
+    "product": "p2",
+    "qty": 4,
+    "key": "k4"
+   },
+   "expect": [
+    {
+     "location": "g1",
+     "product": "p2",
+     "bucket": "on_hand",
+     "delta": -4,
+     "type": "damage",
+     "key": "k4:m1"
+    },
+    {
+     "location": "g1",
+     "product": "p2",
+     "bucket": "damaged",
+     "delta": 4,
+     "type": "damage",
+     "key": "k4:m2"
+    }
+   ]
+  },
+  {
+   "name": "write-off removes damaged stock",
+   "op": "write_off",
+   "input": {
+    "location": "g1",
+    "product": "p2",
+    "qty": 4,
+    "key": "k5"
+   },
+   "expect": [
+    {
+     "location": "g1",
+     "product": "p2",
+     "bucket": "damaged",
+     "delta": -4,
+     "type": "write_off",
+     "key": "k5:m1"
+    }
+   ]
+  },
+  {
+   "name": "dispatch puts stock in transit at the destination",
+   "op": "dispatch",
+   "input": {
+    "from": "g1",
+    "to": "main",
+    "lines": [
+     {
+      "product": "p1",
+      "qty": 5
+     },
+     {
+      "product": "p2",
+      "qty": 2
+     }
+    ],
+    "key": "t1"
+   },
+   "expect": [
+    {
+     "location": "g1",
+     "product": "p1",
+     "bucket": "on_hand",
+     "delta": -5,
+     "type": "transfer_out",
+     "key": "t1:0:out"
+    },
+    {
+     "location": "main",
+     "product": "p1",
+     "bucket": "in_transit",
+     "delta": 5,
+     "type": "transfer_out",
+     "key": "t1:0:transit"
+    },
+    {
+     "location": "g1",
+     "product": "p2",
+     "bucket": "on_hand",
+     "delta": -2,
+     "type": "transfer_out",
+     "key": "t1:1:out"
+    },
+    {
+     "location": "main",
+     "product": "p2",
+     "bucket": "in_transit",
+     "delta": 2,
+     "type": "transfer_out",
+     "key": "t1:1:transit"
+    }
+   ]
+  },
+  {
+   "name": "receiving moves in-transit stock to on hand",
+   "op": "receive_transfer",
+   "input": {
+    "to": "main",
+    "lines": [
+     {
+      "product": "p1",
+      "qty": 5
+     }
+    ],
+    "key": "t1"
+   },
+   "expect": [
+    {
+     "location": "main",
+     "product": "p1",
+     "bucket": "in_transit",
+     "delta": -5,
+     "type": "transfer_in",
+     "key": "t1:recv:0:transit"
+    },
+    {
+     "location": "main",
+     "product": "p1",
+     "bucket": "on_hand",
+     "delta": 5,
+     "type": "transfer_in",
+     "key": "t1:recv:0:in"
+    }
+   ]
+  },
+  {
+   "name": "cancelling returns stock to the source",
+   "op": "cancel_transfer",
+   "input": {
+    "from": "g1",
+    "to": "main",
+    "lines": [
+     {
+      "product": "p1",
+      "qty": 5
+     }
+    ],
+    "key": "t1"
+   },
+   "expect": [
+    {
+     "location": "main",
+     "product": "p1",
+     "bucket": "in_transit",
+     "delta": -5,
+     "type": "transfer_cancel",
+     "key": "t1:cancel:0:transit"
+    },
+    {
+     "location": "g1",
+     "product": "p1",
+     "bucket": "on_hand",
+     "delta": 5,
+     "type": "transfer_cancel",
+     "key": "t1:cancel:0:back"
+    }
+   ]
+  },
+  {
+   "name": "count: only differences become movements",
+   "op": "count",
+   "input": {
+    "location": "main",
+    "lines": [
+     {
+      "product": "p1",
+      "expected": 10,
+      "counted": 10
+     },
+     {
+      "product": "p2",
+      "expected": 10,
+      "counted": 7
+     },
+     {
+      "product": "p3",
+      "expected": 0,
+      "counted": 4
+     }
+    ],
+    "key": "c1"
+   },
+   "expect": [
+    {
+     "location": "main",
+     "product": "p2",
+     "bucket": "on_hand",
+     "delta": -3,
+     "type": "count_adjustment",
+     "key": "c1:1:count"
+    },
+    {
+     "location": "main",
+     "product": "p3",
+     "bucket": "on_hand",
+     "delta": 4,
+     "type": "count_adjustment",
+     "key": "c1:2:count"
+    }
+   ]
+  }
+ ],
+ "errors": [
+  {
+   "name": "restock needs a positive whole number",
+   "op": "receive",
+   "input": {
+    "location": "main",
+    "product": "p1",
+    "qty": 0,
+    "key": "e1"
+   }
+  },
+  {
+   "name": "restock rejects fractions",
+   "op": "receive",
+   "input": {
+    "location": "main",
+    "product": "p1",
+    "qty": 1.5,
+    "key": "e2"
+   }
+  },
+  {
+   "name": "correction needs a non-zero number",
+   "op": "correct",
+   "input": {
+    "location": "main",
+    "product": "p1",
+    "qty": 0,
+    "key": "e3"
+   }
+  },
+  {
+   "name": "damage needs a positive quantity",
+   "op": "damage",
+   "input": {
+    "location": "main",
+    "product": "p1",
+    "qty": -1,
+    "key": "e4"
+   }
+  },
+  {
+   "name": "write-off needs a positive quantity",
+   "op": "write_off",
+   "input": {
+    "location": "main",
+    "product": "p1",
+    "qty": 0,
+    "key": "e5"
+   }
+  },
+  {
+   "name": "transfer to the same place is refused",
+   "op": "dispatch",
+   "input": {
+    "from": "main",
+    "to": "main",
+    "lines": [
+     {
+      "product": "p1",
+      "qty": 1
+     }
+    ],
+    "key": "e6"
+   }
+  },
+  {
+   "name": "transfer lines need a positive quantity",
+   "op": "dispatch",
+   "input": {
+    "from": "g1",
+    "to": "main",
+    "lines": [
+     {
+      "product": "p1",
+      "qty": 0
+     }
+    ],
+    "key": "e7"
+   }
+  },
+  {
+   "name": "a count cannot be negative",
+   "op": "count",
+   "input": {
+    "location": "main",
+    "lines": [
+     {
+      "product": "p1",
+      "expected": 5,
+      "counted": -1
+     }
+    ],
+    "key": "e8"
+   }
+  }
+ ],
+ "scenarios": [
+  {
+   "name": "restock then dispatch then receive",
+   "steps": [
+    {
+     "op": "receive",
+     "input": {
+      "location": "g1",
+      "product": "p1",
+      "qty": 20,
+      "key": "a"
+     }
+    },
+    {
+     "op": "dispatch",
+     "input": {
+      "from": "g1",
+      "to": "main",
+      "lines": [
+       {
+        "product": "p1",
+        "qty": 8
+       }
+      ],
+      "key": "b"
+     }
+    },
+    {
+     "op": "receive_transfer",
+     "input": {
+      "to": "main",
+      "lines": [
+       {
+        "product": "p1",
+        "qty": 8
+       }
+      ],
+      "key": "b"
+     }
+    }
+   ],
+   "balances": {
+    "g1|p1": {
+     "on_hand": 12,
+     "damaged": 0,
+     "in_transit": 0
+    },
+    "main|p1": {
+     "on_hand": 8,
+     "damaged": 0,
+     "in_transit": 0
+    }
+   }
+  },
+  {
+   "name": "dispatch is visible as in transit until received",
+   "steps": [
+    {
+     "op": "receive",
+     "input": {
+      "location": "g1",
+      "product": "p1",
+      "qty": 10,
+      "key": "a"
+     }
+    },
+    {
+     "op": "dispatch",
+     "input": {
+      "from": "g1",
+      "to": "main",
+      "lines": [
+       {
+        "product": "p1",
+        "qty": 4
+       }
+      ],
+      "key": "b"
+     }
+    }
+   ],
+   "balances": {
+    "g1|p1": {
+     "on_hand": 6,
+     "damaged": 0,
+     "in_transit": 0
+    },
+    "main|p1": {
+     "on_hand": 0,
+     "damaged": 0,
+     "in_transit": 4
+    }
+   }
+  },
+  {
+   "name": "a cancelled transfer leaves everything as it was",
+   "steps": [
+    {
+     "op": "receive",
+     "input": {
+      "location": "g1",
+      "product": "p1",
+      "qty": 10,
+      "key": "a"
+     }
+    },
+    {
+     "op": "dispatch",
+     "input": {
+      "from": "g1",
+      "to": "main",
+      "lines": [
+       {
+        "product": "p1",
+        "qty": 4
+       }
+      ],
+      "key": "b"
+     }
+    },
+    {
+     "op": "cancel_transfer",
+     "input": {
+      "from": "g1",
+      "to": "main",
+      "lines": [
+       {
+        "product": "p1",
+        "qty": 4
+       }
+      ],
+      "key": "b"
+     }
+    }
+   ],
+   "balances": {
+    "g1|p1": {
+     "on_hand": 10,
+     "damaged": 0,
+     "in_transit": 0
+    },
+    "main|p1": {
+     "on_hand": 0,
+     "damaged": 0,
+     "in_transit": 0
+    }
+   }
+  },
+  {
+   "name": "damage then write-off",
+   "steps": [
+    {
+     "op": "receive",
+     "input": {
+      "location": "main",
+      "product": "p1",
+      "qty": 10,
+      "key": "a"
+     }
+    },
+    {
+     "op": "damage",
+     "input": {
+      "location": "main",
+      "product": "p1",
+      "qty": 3,
+      "key": "b"
+     }
+    },
+    {
+     "op": "write_off",
+     "input": {
+      "location": "main",
+      "product": "p1",
+      "qty": 2,
+      "key": "c"
+     }
+    }
+   ],
+   "balances": {
+    "main|p1": {
+     "on_hand": 7,
+     "damaged": 1,
+     "in_transit": 0
+    }
+   }
+  },
+  {
+   "name": "a count that finds fewer and more",
+   "steps": [
+    {
+     "op": "receive",
+     "input": {
+      "location": "main",
+      "product": "p1",
+      "qty": 10,
+      "key": "a"
+     }
+    },
+    {
+     "op": "receive",
+     "input": {
+      "location": "main",
+      "product": "p2",
+      "qty": 10,
+      "key": "b"
+     }
+    },
+    {
+     "op": "count",
+     "input": {
+      "location": "main",
+      "lines": [
+       {
+        "product": "p1",
+        "expected": 10,
+        "counted": 7
+       },
+       {
+        "product": "p2",
+        "expected": 10,
+        "counted": 12
+       }
+      ],
+      "key": "c"
+     }
+    }
+   ],
+   "balances": {
+    "main|p1": {
+     "on_hand": 7,
+     "damaged": 0,
+     "in_transit": 0
+    },
+    "main|p2": {
+     "on_hand": 12,
+     "damaged": 0,
+     "in_transit": 0
+    }
+   }
+  },
+  {
+   "name": "moving more than is on hand is rejected and changes nothing",
+   "steps": [
+    {
+     "op": "receive",
+     "input": {
+      "location": "g1",
+      "product": "p1",
+      "qty": 3,
+      "key": "a"
+     }
+    },
+    {
+     "op": "dispatch",
+     "input": {
+      "from": "g1",
+      "to": "main",
+      "lines": [
+       {
+        "product": "p1",
+        "qty": 5
+       }
+      ],
+      "key": "b"
+     },
+     "expectRejected": true
+    }
+   ],
+   "balances": {
+    "g1|p1": {
+     "on_hand": 3,
+     "damaged": 0,
+     "in_transit": 0
+    }
+   }
+  }
+ ]
+}
